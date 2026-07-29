@@ -29,8 +29,7 @@
 以 root 用户运行（交互式，可传参，安装过程中会询问域名）：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/nekoimi/xLink-Installer/master/install.sh) \
-  -d panel.example.com -s sub.example.com
+bash <(curl -fsSL https://raw.githubusercontent.com/nekoimi/xLink-Installer/master/install.sh) -d panel.example.com -s sub.example.com
 ```
 
 使用 sudo 时，请先下载再执行（`sudo` 下进程替换可能无法读取脚本）：
