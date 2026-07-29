@@ -27,6 +27,8 @@ PANEL_PORT="${PANEL_PORT_DEFAULT}"
 SUB_PORT="${SUB_PORT_DEFAULT}"
 ENABLE_BBR=1
 ASSUME_YES=0
+TIMEZONE="Asia/Shanghai"                 # 系统时区，可用 --tz 覆盖
+FALLBACK_URL="https://www.baidu.com"     # 直接用 IP/未知域名访问时的跳转目标，空/none 则不生成兜底站点
 
 # 从 3x-ui 实际配置回读的结果
 XUI_PORT=""      # 面板真实监听端口
@@ -75,6 +77,8 @@ ${SCRIPT_NAME} - 一键部署 3x-ui + Caddy 自动 HTTPS 反向代理
   -s, --sub-domain <域名> 订阅访问域名（与面板域名分开，例如 sub.example.com）
   -p, --port <端口>       3x-ui 面板本地端口（默认 ${PANEL_PORT_DEFAULT}，通常自动回读）
       --sub-port <端口>   3x-ui 订阅本地端口（默认 ${SUB_PORT_DEFAULT}，通常自动回读）
+      --tz <时区>         系统时区（默认 ${TIMEZONE}）
+      --fallback-url <URL> 直接用 IP/未知域名访问时跳转的地址（默认 ${FALLBACK_URL}，填 none 关闭）
       --no-bbr            不启用 BBR 加速
   -y, --yes               非交互模式，使用默认值不再询问
   -h, --help              显示本帮助
@@ -92,6 +96,8 @@ parse_args() {
             -s|--sub-domain) SUB_DOMAIN="${2:-}"; shift 2 ;;
             -p|--port)       PANEL_PORT="${2:-}"; shift 2 ;;
             --sub-port)      SUB_PORT="${2:-}"; shift 2 ;;
+            --tz)            TIMEZONE="${2:-}"; shift 2 ;;
+            --fallback-url)  FALLBACK_URL="${2:-}"; shift 2 ;;
             --no-bbr)        ENABLE_BBR=0; shift ;;
             -y|--yes)        ASSUME_YES=1; shift ;;
             -h|--help)       usage; exit 0 ;;
@@ -412,6 +418,10 @@ configure_caddy() {
             echo ""
             caddy_site_block "${SUB_DOMAIN}" "${SUB_PORT}"
         fi
+        if [[ -n "${FALLBACK_URL}" && "${FALLBACK_URL}" != "none" ]]; then
+            echo ""
+            caddy_fallback_block
+        fi
     } > "${CADDYFILE}"
 
     caddy validate --config "${CADDYFILE}" --adapter caddyfile \
@@ -432,6 +442,24 @@ ${domain} {
         header_up Host {host}
         header_up X-Real-IP {remote_host}
     }
+}
+EOF
+}
+
+# 兜底站点：凡未命中上面具名域名的请求（例如直接用服务器 IP 或未知域名访问）
+# 一律 302 跳转到 FALLBACK_URL，避免暴露/直连真实服务。
+#   - http://  兜底无需证书；ACME HTTP-01 验证由 Caddy 内部优先处理，不受影响
+#   - https:// 兜底用 tls internal 自签证书（浏览器会提示，但足以拦截扫描/直连）
+caddy_fallback_block() {
+    cat <<EOF
+# 直接用 IP / 未知域名访问 → 跳转 ${FALLBACK_URL}
+http:// {
+    redir ${FALLBACK_URL} 302
+}
+
+https:// {
+    tls internal
+    redir ${FALLBACK_URL} 302
 }
 EOF
 }
@@ -479,6 +507,61 @@ configure_firewall() {
     else
         warn "未检测到启用的防火墙(ufw/firewalld)，请自行确认云厂商安全组已放行 80/443"
     fi
+}
+
+# ---------------------------------------------------------------------------
+# 系统初始化优化：时区、时间同步、文件句柄上限、网络内核参数
+# ---------------------------------------------------------------------------
+optimize_system() {
+    log "执行系统初始化优化..."
+
+    # 1) 时区
+    if [[ -n "${TIMEZONE}" ]]; then
+        if command -v timedatectl >/dev/null 2>&1; then
+            timedatectl set-timezone "${TIMEZONE}" >/dev/null 2>&1 \
+                && ok "时区已设置为 ${TIMEZONE}" \
+                || warn "设置时区 ${TIMEZONE} 失败，请手动执行 timedatectl set-timezone ${TIMEZONE}"
+        elif [[ -f "/usr/share/zoneinfo/${TIMEZONE}" ]]; then
+            ln -sf "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime \
+                && printf '%s\n' "${TIMEZONE}" > /etc/timezone 2>/dev/null || true
+            ok "时区已设置为 ${TIMEZONE}"
+        else
+            warn "未找到时区数据 ${TIMEZONE}，跳过"
+        fi
+    fi
+
+    # 2) 启用 NTP 网络时间同步
+    if command -v timedatectl >/dev/null 2>&1; then
+        timedatectl set-ntp true >/dev/null 2>&1 && ok "已启用 NTP 时间同步" || true
+    fi
+
+    # 3) 提高文件句柄上限（代理服务并发连接多）
+    local limits=/etc/security/limits.d/99-xlink.conf
+    cat > "${limits}" <<'EOF'
+* soft nofile 655350
+* hard nofile 655350
+root soft nofile 655350
+root hard nofile 655350
+EOF
+    ok "已提高文件句柄上限 (nofile=655350)"
+
+    # 4) 网络内核参数优化（转发/连接/缓冲区），与 BBR 分开管理
+    local netconf=/etc/sysctl.d/99-xlink-net.conf
+    cat > "${netconf}" <<'EOF'
+# 由 xLink-Installer 生成：网络优化
+net.ipv4.ip_forward = 1
+net.ipv4.tcp_fastopen = 3
+net.core.somaxconn = 32768
+net.core.netdev_max_backlog = 32768
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_slow_start_after_idle = 0
+fs.file-max = 1000000
+EOF
+    sysctl --system >/dev/null 2>&1 || true
+    ok "已应用网络内核参数优化"
 }
 
 # ---------------------------------------------------------------------------
@@ -531,6 +614,8 @@ EOF
 
     cat <<EOF
   服务器 IP    : ${ip}
+  系统时区     : ${TIMEZONE}
+  IP直连处理   : $(if [[ -n "${FALLBACK_URL}" && "${FALLBACK_URL}" != "none" ]]; then printf '直接访问 IP/未知域名 → 跳转 %s' "${FALLBACK_URL}"; else printf '未启用兜底跳转'; fi)
 
   管理 3x-ui   : 运行命令  x-ui
   查看面板凭据 : x-ui  ->  查看当前面板设置
@@ -583,6 +668,7 @@ main() {
 
     pkg_update
     install_common_tools
+    optimize_system
     enable_bbr
     install_xui
     read_xui_settings
