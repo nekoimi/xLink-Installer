@@ -12,8 +12,12 @@ set -Eeuo pipefail
 readonly SCRIPT_NAME="xLink-Installer"
 readonly PANEL_PORT_DEFAULT=2053
 readonly SUB_PORT_DEFAULT=2096
-readonly XUI_INSTALL_URL="https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh"
+readonly XUI_INSTALL_COMMIT="d2ac3b4d7a107dd42a479af57bd597bed9d1a526"
+readonly XUI_INSTALL_SHA256="9ac30d905e82b61540dc6b0ae9d2ad956f6013532ba5fdca29ab182713c10787"
+readonly XUI_INSTALL_URL="https://raw.githubusercontent.com/MHSanaei/3x-ui/${XUI_INSTALL_COMMIT}/install.sh"
 readonly CADDYFILE="/etc/caddy/Caddyfile"
+readonly CADDY_CONF_DIR="/etc/caddy/conf.d"
+readonly CADDY_SNIPPET="${CADDY_CONF_DIR}/xlink.caddy"
 readonly LOG_FILE="/var/log/xlink-install.log"
 readonly XUI_DB="/etc/x-ui/x-ui.db"
 readonly XUI_BIN="/usr/local/x-ui/x-ui"
@@ -27,8 +31,8 @@ PANEL_PORT="${PANEL_PORT_DEFAULT}"
 SUB_PORT="${SUB_PORT_DEFAULT}"
 ENABLE_BBR=1
 ASSUME_YES=0
-TIMEZONE="Asia/Shanghai"                 # 系统时区，可用 --tz 覆盖
-FALLBACK_URL="https://www.baidu.com"     # 直接用 IP/未知域名访问时的跳转目标，空/none 则不生成兜底站点
+TIMEZONE="Asia/Shanghai"             # 系统时区，可用 --tz 覆盖
+FALLBACK_URL="none"                  # HTTP IP/未知域名兜底；默认关闭，避免影响后续新增站点
 
 # 从 3x-ui 实际配置回读的结果
 XUI_PORT=""      # 面板真实监听端口
@@ -38,6 +42,8 @@ XUI_SUB_PORT=""      # 订阅真实端口
 XUI_SUB_PATH=""      # 订阅路径 subPath
 XUI_SUB_LISTEN=""    # 订阅监听地址
 XUI_SUB_ENABLE=""    # 订阅是否启用
+XUI_TLS_ENABLED=0     # 面板上游是否启用了 TLS（兼容已有安装）
+XUI_SUB_TLS_ENABLED=0 # 订阅上游是否启用了 TLS（兼容已有安装）
 XUI_USER=""          # 面板用户名（从 install-result.env 回读）
 XUI_PASS=""          # 面板密码（从 install-result.env 回读）
 
@@ -78,7 +84,7 @@ ${SCRIPT_NAME} - 一键部署 3x-ui + Caddy 自动 HTTPS 反向代理
   -p, --port <端口>       3x-ui 面板本地端口（默认 ${PANEL_PORT_DEFAULT}，通常自动回读）
       --sub-port <端口>   3x-ui 订阅本地端口（默认 ${SUB_PORT_DEFAULT}，通常自动回读）
       --tz <时区>         系统时区（默认 ${TIMEZONE}）
-      --fallback-url <URL> 直接用 IP/未知域名访问时跳转的地址（默认 ${FALLBACK_URL}，填 none 关闭）
+      --fallback-url <URL> HTTP 直接用 IP/未知域名访问时跳转的地址（默认关闭，填 none 关闭）
       --no-bbr            不启用 BBR 加速
   -y, --yes               非交互模式，使用默认值不再询问
   -h, --help              显示本帮助
@@ -149,13 +155,20 @@ validate_config() {
     fi
     if [[ -n "${SUB_DOMAIN}" ]]; then
         is_valid_domain "${SUB_DOMAIN}" || die "订阅域名格式不合法: ${SUB_DOMAIN}"
-        [[ "${SUB_DOMAIN}" != "${DOMAIN}" ]] || die "订阅域名必须与面板域名不同"
+        [[ "${SUB_DOMAIN,,}" != "${DOMAIN,,}" ]] || die "订阅域名必须与面板域名不同"
     else
         warn "未提供订阅域名，将只配置面板反向代理"
     fi
 
     [[ "${PANEL_PORT}" =~ ^[0-9]+$ ]] || die "面板端口必须为数字: ${PANEL_PORT}"
     [[ "${SUB_PORT}"   =~ ^[0-9]+$ ]] || die "订阅端口必须为数字: ${SUB_PORT}"
+    (( PANEL_PORT >= 1 && PANEL_PORT <= 65535 )) || die "面板端口必须在 1-65535 之间: ${PANEL_PORT}"
+    (( SUB_PORT >= 1 && SUB_PORT <= 65535 )) || die "订阅端口必须在 1-65535 之间: ${SUB_PORT}"
+
+    if [[ -n "${FALLBACK_URL}" && "${FALLBACK_URL}" != "none" ]]; then
+        [[ "${FALLBACK_URL}" =~ ^https?://[^[:space:]{}]+$ ]] \
+            || die "兜底跳转地址必须是合法的 http/https URL，或填写 none 关闭: ${FALLBACK_URL}"
+    fi
 
     warn "请确认下列域名的 A/AAAA 记录均已解析到本机公网 IP，否则证书申请会失败："
     warn "  面板: ${DOMAIN}${SUB_DOMAIN:+   订阅: ${SUB_DOMAIN}}"
@@ -166,7 +179,10 @@ validate_config() {
 }
 
 is_valid_domain() {
-    [[ "$1" =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]
+    local domain="$1"
+    (( ${#domain} <= 253 )) || return 1
+    [[ "${domain}" != *..* ]] || return 1
+    [[ "${domain}" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]([A-Za-z0-9-]{0,61}[A-Za-z0-9])$ ]]
 }
 
 # ---------------------------------------------------------------------------
@@ -239,13 +255,23 @@ install_xui() {
     #   - 非交互模式按 XUI_SSL_MODE 映射：domain->1 / ip->2 / none|空->4(跳过，不生成任何证书)。
     #   这里显式设 XUI_SSL_MODE=none，确保面板以明文 HTTP 监听、绝不生成 IP 自签证书，TLS 全部交给 Caddy。
     #   XUI_DB_TYPE=sqlite 固定使用 sqlite（默认），避免落到 postgres 分支。
-    local tmp="/tmp/3xui-install.$$.sh"
-    curl -Ls "${XUI_INSTALL_URL}" -o "${tmp}" || die "下载 3x-ui 安装脚本失败"
-    XUI_NONINTERACTIVE=1 XUI_SSL_MODE=none XUI_DB_TYPE=sqlite \
-        bash "${tmp}" </dev/null 2>&1 | tee -a "${LOG_FILE}"
+    local tmp actual_sha256
+    tmp="$(mktemp /tmp/3xui-install.XXXXXX.sh)" || die "无法创建临时文件"
+    if ! curl -fLsS "${XUI_INSTALL_URL}" -o "${tmp}"; then
+        rm -f "${tmp}"
+        die "下载 3x-ui 安装脚本失败"
+    fi
+    actual_sha256="$(sha256sum "${tmp}" | awk '{print $1}')"
+    if [[ "${actual_sha256}" != "${XUI_INSTALL_SHA256}" ]]; then
+        rm -f "${tmp}"
+        die "3x-ui 安装脚本校验失败，拒绝以 root 执行"
+    fi
+    if ! XUI_NONINTERACTIVE=1 XUI_SSL_MODE=none XUI_DB_TYPE=sqlite \
+        bash "${tmp}" </dev/null 2>&1 | tee -a "${LOG_FILE}"; then
+        rm -f "${tmp}"
+        die "3x-ui 安装失败，请查看 ${LOG_FILE}"
+    fi
     rm -f "${tmp}"
-    # 安装日志含随机密码，收紧权限
-    chmod 600 "${LOG_FILE}" 2>/dev/null || true
 
     command -v x-ui >/dev/null 2>&1 || die "3x-ui 安装失败，请查看 ${LOG_FILE}"
     systemctl is-active --quiet x-ui || { systemctl start x-ui || true; }
@@ -263,9 +289,13 @@ read_xui_settings() {
     if [[ -f "${XUI_RESULT_ENV}" ]]; then
         # 在子 shell 中 source，避免污染当前环境；仅取需要的字段
         local _port _path _user _pass
+        # shellcheck disable=SC1090
         _port="$( set +u; . "${XUI_RESULT_ENV}" >/dev/null 2>&1; printf '%s' "${XUI_PANEL_PORT:-}" )"
+        # shellcheck disable=SC1090
         _path="$( set +u; . "${XUI_RESULT_ENV}" >/dev/null 2>&1; printf '%s' "${XUI_WEB_BASE_PATH:-}" )"
+        # shellcheck disable=SC1090
         _user="$( set +u; . "${XUI_RESULT_ENV}" >/dev/null 2>&1; printf '%s' "${XUI_USERNAME:-}" )"
+        # shellcheck disable=SC1090
         _pass="$( set +u; . "${XUI_RESULT_ENV}" >/dev/null 2>&1; printf '%s' "${XUI_PASSWORD:-}" )"
         [[ -n "${_port}" ]] && XUI_PORT="${_port}"
         [[ -n "${_path}" ]] && XUI_PATH="${_path}"
@@ -273,16 +303,25 @@ read_xui_settings() {
         XUI_PASS="${_pass}"
     fi
 
-    # 2) sqlite settings 表：补齐面板端口/路径/监听 + 订阅相关键
+    # 2) sqlite settings 表：实时配置优先于安装时生成的 env，避免重跑时使用旧端口/路径
     if command -v sqlite3 >/dev/null 2>&1 && [[ -f "${XUI_DB}" ]]; then
         db_read() { sqlite3 "${XUI_DB}" "SELECT value FROM settings WHERE key='$1' LIMIT 1;" 2>/dev/null || true; }
-        [[ -n "${XUI_PORT}" ]] || XUI_PORT="$(db_read webPort)"
-        [[ -n "${XUI_PATH}" ]] || XUI_PATH="$(db_read webBasePath)"
+        local db_port db_path web_cert web_key sub_cert sub_key
+        db_port="$(db_read webPort)"
+        db_path="$(db_read webBasePath)"
+        [[ -n "${db_port}" ]] && XUI_PORT="${db_port}"
+        [[ -n "${db_path}" ]] && XUI_PATH="${db_path}"
         XUI_LISTEN="$(db_read webListen)"
         XUI_SUB_PORT="$(db_read subPort)"
         XUI_SUB_PATH="$(db_read subPath)"
         XUI_SUB_LISTEN="$(db_read subListen)"
         XUI_SUB_ENABLE="$(db_read subEnable)"
+        web_cert="$(db_read webCertFile)"
+        web_key="$(db_read webKeyFile)"
+        sub_cert="$(db_read subCertFile)"
+        sub_key="$(db_read subKeyFile)"
+        [[ -n "${web_cert}" && -n "${web_key}" ]] && XUI_TLS_ENABLED=1
+        [[ -n "${sub_cert}" && -n "${sub_key}" ]] && XUI_SUB_TLS_ENABLED=1
     fi
     # 端口回读失败时退回到传入值，避免中断
     [[ -n "${XUI_PORT}" ]] || { XUI_PORT="${PANEL_PORT}"; warn "未能回读面板端口，使用 ${PANEL_PORT}"; }
@@ -292,9 +331,9 @@ read_xui_settings() {
     # webBasePath / subPath 归一化为形如 /path/
     XUI_PATH="$(normalize_path "${XUI_PATH}")"
     XUI_SUB_PATH="$(normalize_path "${XUI_SUB_PATH}")"
-    ok "面板配置: 端口=${PANEL_PORT} 路径=${XUI_PATH:-/} 监听=${XUI_LISTEN:-0.0.0.0}"
+    ok "面板配置: 端口=${PANEL_PORT} 路径=${XUI_PATH:-/} 监听=${XUI_LISTEN:-0.0.0.0} 上游=$( (( XUI_TLS_ENABLED )) && printf HTTPS || printf HTTP )"
     if [[ -n "${SUB_DOMAIN}" ]]; then
-        ok "订阅配置: 端口=${SUB_PORT} 路径=${XUI_SUB_PATH:-/} 监听=${XUI_SUB_LISTEN:-0.0.0.0} 启用=${XUI_SUB_ENABLE:-未知}"
+        ok "订阅配置: 端口=${SUB_PORT} 路径=${XUI_SUB_PATH:-/} 监听=${XUI_SUB_LISTEN:-0.0.0.0} 启用=${XUI_SUB_ENABLE:-未知} 上游=$( (( XUI_SUB_TLS_ENABLED )) && printf HTTPS || printf HTTP )"
         [[ "${XUI_SUB_ENABLE}" == "true" ]] || warn "3x-ui 订阅服务未启用，订阅域名暂不可用；请在面板『订阅设置』中开启后生效"
     fi
 }
@@ -346,17 +385,17 @@ bind_xui_localhost() {
     # 订阅：无官方 CLI 直接项，best-effort 写 sqlite subListen（订阅默认未启用，启用后生效）
     if [[ -n "${SUB_DOMAIN}" && "${XUI_SUB_LISTEN}" != "127.0.0.1" ]]; then
         log "将订阅监听地址绑定到 127.0.0.1..."
-        db_upsert subListen "127.0.0.1" && changed=1 \
-            || warn "未能绑定订阅监听地址，启用订阅后请在面板设置中手动改为 127.0.0.1"
+        if db_upsert subListen "127.0.0.1"; then
+            changed=1
+        else
+            warn "未能绑定订阅监听地址，启用订阅后请在面板设置中手动改为 127.0.0.1"
+        fi
     fi
 
-    # TLS 由 Caddy 统一终止，面板须以明文 HTTP 监听本地。
-    # 非交互 XUI_SSL_MODE=none 不会生成证书；但若为“已存在的旧安装”，可能残留证书配置，
-    # 会导致 Caddy 反代 http 失败。此处只做检测告警，不擅自清空既有配置。
-    if command -v sqlite3 >/dev/null 2>&1 && [[ -f "${XUI_DB}" ]]; then
-        if [[ -n "$(sqlite3 "${XUI_DB}" "SELECT 1 FROM settings WHERE key IN ('webCertFile','webKeyFile') AND value<>'' LIMIT 1;" 2>/dev/null)" ]]; then
-            warn "检测到面板已配置 TLS 证书，Caddy 反代明文 HTTP 可能失败；请在面板『面板设置』中清空证书路径后重启 x-ui"
-        fi
+    # 新安装由 Caddy 终止 TLS；已有安装若保留了 3x-ui 证书，则 Caddy 自动使用 HTTPS 上游。
+    (( XUI_TLS_ENABLED == 1 )) && warn "检测到面板已有 TLS 配置，将使用 HTTPS 上游兼容现有安装"
+    if [[ -n "${SUB_DOMAIN}" ]] && (( XUI_SUB_TLS_ENABLED == 1 )); then
+        warn "检测到订阅服务已有 TLS 配置，将使用 HTTPS 上游兼容现有安装"
     fi
 
     if [[ "${changed}" -eq 1 ]]; then
@@ -369,11 +408,17 @@ bind_xui_localhost() {
         fi
     fi
 
-    [[ "${XUI_LISTEN}" == "127.0.0.1" ]] && ok "面板已绑定 127.0.0.1" \
-        || warn "面板监听为 ${XUI_LISTEN:-未知}，请确认已绑定 127.0.0.1，并确保安全组不放行面板端口"
+    if [[ "${XUI_LISTEN}" == "127.0.0.1" ]]; then
+        ok "面板已绑定 127.0.0.1"
+    else
+        warn "面板监听为 ${XUI_LISTEN:-未知}，请确认已绑定 127.0.0.1，并确保安全组不放行面板端口"
+    fi
     if [[ -n "${SUB_DOMAIN}" ]]; then
-        [[ "${XUI_SUB_LISTEN}" == "127.0.0.1" ]] && ok "订阅已绑定 127.0.0.1" \
-            || warn "订阅监听为 ${XUI_SUB_LISTEN:-未知}，启用订阅后请确认绑定 127.0.0.1，并确保安全组不放行订阅端口"
+        if [[ "${XUI_SUB_LISTEN}" == "127.0.0.1" ]]; then
+            ok "订阅已绑定 127.0.0.1"
+        else
+            warn "订阅监听为 ${XUI_SUB_LISTEN:-未知}，启用订阅后请确认绑定 127.0.0.1，并确保安全组不放行订阅端口"
+        fi
     fi
 }
 
@@ -407,58 +452,108 @@ install_caddy() {
 # Caddy 反向代理配置（自动 HTTPS）
 # ---------------------------------------------------------------------------
 configure_caddy() {
-    log "写入 Caddy 配置: ${CADDYFILE}"
-    mkdir -p "$(dirname "${CADDYFILE}")"
-    [[ -f "${CADDYFILE}" ]] && cp -a "${CADDYFILE}" "${CADDYFILE}.bak.$(date +%s)"
+    local stamp main_existed=0 snippet_existed=0 tmp_snippet
+    stamp="$(date +%Y%m%d%H%M%S)"
+    tmp_snippet="${CADDY_SNIPPET}.tmp.$$"
+    log "写入 xLink 独立 Caddy 配置: ${CADDY_SNIPPET}"
+    mkdir -p "$(dirname "${CADDYFILE}")" "${CADDY_CONF_DIR}"
+
+    [[ -f "${CADDYFILE}" ]] && main_existed=1
+    [[ -f "${CADDY_SNIPPET}" ]] && snippet_existed=1
+    (( main_existed )) && cp -a "${CADDYFILE}" "${CADDYFILE}.bak.${stamp}"
+    (( snippet_existed )) && cp -a "${CADDY_SNIPPET}" "${CADDY_SNIPPET}.bak.${stamp}"
 
     {
-        echo "# 由 ${SCRIPT_NAME} 生成"
-        caddy_site_block "${DOMAIN}" "${PANEL_PORT}"
+        echo "# 由 ${SCRIPT_NAME} 管理；其他服务请使用 conf.d 下的独立 .caddy 文件"
+        caddy_site_block "${DOMAIN}" "${PANEL_PORT}" "${XUI_TLS_ENABLED}"
         if [[ -n "${SUB_DOMAIN}" ]]; then
             echo ""
-            caddy_site_block "${SUB_DOMAIN}" "${SUB_PORT}"
+            caddy_site_block "${SUB_DOMAIN}" "${SUB_PORT}" "${XUI_SUB_TLS_ENABLED}"
         fi
         if [[ -n "${FALLBACK_URL}" && "${FALLBACK_URL}" != "none" ]]; then
             echo ""
             caddy_fallback_block
         fi
-    } > "${CADDYFILE}"
+    } > "${tmp_snippet}"
+    chmod 644 "${tmp_snippet}"
+    mv -f "${tmp_snippet}" "${CADDY_SNIPPET}"
 
-    caddy validate --config "${CADDYFILE}" --adapter caddyfile \
-        || die "Caddyfile 校验失败，请检查配置"
+    if (( ! main_existed )); then
+        printf '# Caddy 主配置：自动加载各服务的独立配置片段\nimport %s/*.caddy\n' \
+            "${CADDY_CONF_DIR}" > "${CADDYFILE}"
+    elif ! grep -Fq "import ${CADDY_CONF_DIR}/*.caddy" "${CADDYFILE}"; then
+        printf '\n# xLink-Installer：加载独立服务配置，不覆盖现有站点\nimport %s/*.caddy\n' \
+            "${CADDY_CONF_DIR}" >> "${CADDYFILE}"
+    fi
+
+    if ! caddy validate --config "${CADDYFILE}" --adapter caddyfile; then
+        if (( main_existed )); then
+            cp -a "${CADDYFILE}.bak.${stamp}" "${CADDYFILE}"
+        else
+            rm -f "${CADDYFILE}"
+        fi
+        if (( snippet_existed )); then
+            cp -a "${CADDY_SNIPPET}.bak.${stamp}" "${CADDY_SNIPPET}"
+        else
+            rm -f "${CADDY_SNIPPET}"
+        fi
+        die "Caddy 配置校验失败，已恢复修改前的配置"
+    fi
 
     systemctl enable caddy >/dev/null 2>&1 || true
-    systemctl restart caddy || die "Caddy 启动失败，请查看 journalctl -u caddy"
+    if ! systemctl restart caddy; then
+        if (( main_existed )); then
+            cp -a "${CADDYFILE}.bak.${stamp}" "${CADDYFILE}"
+        else
+            rm -f "${CADDYFILE}"
+        fi
+        if (( snippet_existed )); then
+            cp -a "${CADDY_SNIPPET}.bak.${stamp}" "${CADDY_SNIPPET}"
+        else
+            rm -f "${CADDY_SNIPPET}"
+        fi
+        systemctl restart caddy >/dev/null 2>&1 || true
+        die "Caddy 启动失败，已恢复修改前的配置；请查看 journalctl -u caddy"
+    fi
     ok "Caddy 已启动并将自动为 ${DOMAIN}${SUB_DOMAIN:+ 、${SUB_DOMAIN}} 申请证书"
 }
 
-# 生成单个 Caddy 站点块：<域名> 反代到 127.0.0.1:<端口>
+# 生成单个 Caddy 站点块，并显式保留该域名的 HTTP -> HTTPS 跳转。
 caddy_site_block() {
-    local domain="$1" port="$2"
+    local domain="$1" port="$2" tls_enabled="$3" upstream
+    if (( tls_enabled )); then
+        upstream="https://127.0.0.1:${port}"
+    else
+        upstream="127.0.0.1:${port}"
+    fi
     cat <<EOF
+http://${domain} {
+    redir https://${domain}{uri} 308
+}
+
 ${domain} {
     encode zstd gzip
-    reverse_proxy 127.0.0.1:${port} {
+    reverse_proxy ${upstream} {
         header_up Host {host}
         header_up X-Real-IP {remote_host}
+$(if (( tls_enabled )); then cat <<'TLS_EOF'
+        transport http {
+            tls_insecure_skip_verify
+        }
+TLS_EOF
+fi)
     }
 }
 EOF
 }
 
 # 兜底站点：凡未命中上面具名域名的请求（例如直接用服务器 IP 或未知域名访问）
-# 一律 302 跳转到 FALLBACK_URL，避免暴露/直连真实服务。
-#   - http://  兜底无需证书；ACME HTTP-01 验证由 Caddy 内部优先处理，不受影响
-#   - https:// 兜底用 tls internal 自签证书（浏览器会提示，但足以拦截扫描/直连）
+# HTTP 请求统一 302 跳转到 FALLBACK_URL。未知 HTTPS 域名无法在 TLS 握手前可靠跳转，
+# 因此不签发通配的内部证书，直接拒绝这类连接。
 caddy_fallback_block() {
     cat <<EOF
 # 直接用 IP / 未知域名访问 → 跳转 ${FALLBACK_URL}
 http:// {
-    redir ${FALLBACK_URL} 302
-}
-
-https:// {
-    tls internal
     redir ${FALLBACK_URL} 302
 }
 EOF
@@ -470,7 +565,7 @@ EOF
 wait_for_port() {
     local port="$1" label="$2" i
     log "等待${label}端口 ${port} 就绪..."
-    for i in $(seq 1 15); do
+    for ((i = 1; i <= 15; i++)); do
         if ss -ltn 2>/dev/null | grep -q ":${port}\b" \
            || curl -s -o /dev/null --max-time 2 "http://127.0.0.1:${port}"; then
             ok "${label}端口 ${port} 已在监听"
@@ -518,9 +613,11 @@ optimize_system() {
     # 1) 时区
     if [[ -n "${TIMEZONE}" ]]; then
         if command -v timedatectl >/dev/null 2>&1; then
-            timedatectl set-timezone "${TIMEZONE}" >/dev/null 2>&1 \
-                && ok "时区已设置为 ${TIMEZONE}" \
-                || warn "设置时区 ${TIMEZONE} 失败，请手动执行 timedatectl set-timezone ${TIMEZONE}"
+            if timedatectl set-timezone "${TIMEZONE}" >/dev/null 2>&1; then
+                ok "时区已设置为 ${TIMEZONE}"
+            else
+                warn "设置时区 ${TIMEZONE} 失败，请手动执行 timedatectl set-timezone ${TIMEZONE}"
+            fi
         elif [[ -f "/usr/share/zoneinfo/${TIMEZONE}" ]]; then
             ln -sf "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime \
                 && printf '%s\n' "${TIMEZONE}" > /etc/timezone 2>/dev/null || true
@@ -651,7 +748,9 @@ on_error() {
 }
 
 setup_logging() {
-    touch "${LOG_FILE}" 2>/dev/null || true
+    # 安装输出包含随机账号密码；从创建文件的第一刻起就只允许 root 读取。
+    ( umask 077; touch "${LOG_FILE}" ) || die "无法创建安装日志: ${LOG_FILE}"
+    chmod 600 "${LOG_FILE}" || die "无法收紧安装日志权限: ${LOG_FILE}"
     log "安装日志: ${LOG_FILE}"
 }
 
