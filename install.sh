@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # xLink-Installer
-# 自动化部署 3x-ui 面板 + Caddy 反向代理（自动 HTTPS）
+# 自动化部署 3x-ui + Caddy :9443 + rathole :443
 # 支持 Ubuntu/Debian 与 CentOS/RHEL 系列
 #
 set -Eeuo pipefail
@@ -12,6 +12,17 @@ set -Eeuo pipefail
 readonly SCRIPT_NAME="xLink-Installer"
 readonly PANEL_PORT_DEFAULT=2053
 readonly SUB_PORT_DEFAULT=2096
+readonly CADDY_HTTPS_PORT=9443
+readonly RATHOLE_TUNNEL_PORT_DEFAULT=2333
+readonly RATHOLE_VERSION="v0.5.0"
+readonly RATHOLE_AMD64_SHA256="3e7d0d0f365120cd3cd351d147d1a12ee960c8068b464d4dd533a3821873b80e"
+readonly RATHOLE_ARM64_SHA256="fa4a6fc63d86f8f1faa7c103a845e4715ce79a048455c0eec897b27237576564"
+readonly RATHOLE_AMD64_BIN_SHA256="d2202f2aa3a432135bddbe1c6104600c6577cd4507a70e77c08741c7ad879926"
+readonly RATHOLE_ARM64_BIN_SHA256="c95474d2ecdc031b3bb20c495595a0d6c6440c1ff7748f594d7ecd5315d36e8f"
+readonly RATHOLE_BIN="/usr/local/bin/rathole"
+readonly RATHOLE_CONFIG="/etc/rathole/server.toml"
+readonly RATHOLE_CLIENT_EXAMPLE="/etc/rathole/client-example.toml"
+readonly RATHOLE_UNIT="/etc/systemd/system/rathole.service"
 readonly XUI_INSTALL_COMMIT="d2ac3b4d7a107dd42a479af57bd597bed9d1a526"
 readonly XUI_INSTALL_SHA256="9ac30d905e82b61540dc6b0ae9d2ad956f6013532ba5fdca29ab182713c10787"
 readonly XUI_INSTALL_URL="https://raw.githubusercontent.com/MHSanaei/3x-ui/${XUI_INSTALL_COMMIT}/install.sh"
@@ -33,6 +44,7 @@ ENABLE_BBR=1
 ASSUME_YES=0
 TIMEZONE="Asia/Shanghai"             # 系统时区，可用 --tz 覆盖
 FALLBACK_URL="none"                  # HTTP IP/未知域名兜底；默认关闭，避免影响后续新增站点
+RATHOLE_TUNNEL_PORT="${RATHOLE_TUNNEL_PORT_DEFAULT}"
 
 # 从 3x-ui 实际配置回读的结果
 XUI_PORT=""      # 面板真实监听端口
@@ -51,6 +63,9 @@ XUI_PASS=""          # 面板密码（从 install-result.env 回读）
 OS_FAMILY=""   # debian | rhel
 PKG_MGR=""     # apt | dnf | yum
 ARCH=""
+CADDY_BACKUP_STAMP=""
+CADDY_MAIN_EXISTED=0
+CADDY_SNIPPET_EXISTED=0
 
 # 颜色
 readonly C_RESET='\033[0m'
@@ -73,7 +88,7 @@ die()  { err "$*"; exit 1; }
 # ---------------------------------------------------------------------------
 usage() {
     cat <<EOF
-${SCRIPT_NAME} - 一键部署 3x-ui + Caddy 自动 HTTPS 反向代理
+${SCRIPT_NAME} - 部署 3x-ui + Caddy :${CADDY_HTTPS_PORT} + rathole :443
 
 用法:
   sudo bash install.sh [选项]
@@ -85,6 +100,7 @@ ${SCRIPT_NAME} - 一键部署 3x-ui + Caddy 自动 HTTPS 反向代理
       --sub-port <端口>   3x-ui 订阅本地端口（默认 ${SUB_PORT_DEFAULT}，通常自动回读）
       --tz <时区>         系统时区（默认 ${TIMEZONE}）
       --fallback-url <URL> HTTP 直接用 IP/未知域名访问时跳转的地址（默认关闭，填 none 关闭）
+      --rathole-port <端口> rathole 客户端连接端口（默认 ${RATHOLE_TUNNEL_PORT_DEFAULT}，公网业务入口固定为 TCP 443）
       --no-bbr            不启用 BBR 加速
   -y, --yes               非交互模式，使用默认值不再询问
   -h, --help              显示本帮助
@@ -104,6 +120,7 @@ parse_args() {
             --sub-port)      SUB_PORT="${2:-}"; shift 2 ;;
             --tz)            TIMEZONE="${2:-}"; shift 2 ;;
             --fallback-url)  FALLBACK_URL="${2:-}"; shift 2 ;;
+            --rathole-port)  RATHOLE_TUNNEL_PORT="${2:-}"; shift 2 ;;
             --no-bbr)        ENABLE_BBR=0; shift ;;
             -y|--yes)        ASSUME_YES=1; shift ;;
             -h|--help)       usage; exit 0 ;;
@@ -136,7 +153,7 @@ detect_system() {
     case "$(uname -m)" in
         x86_64|amd64) ARCH="amd64" ;;
         aarch64|arm64) ARCH="arm64" ;;
-        *) warn "未识别的架构 $(uname -m)，继续尝试" ;;
+        *) die "rathole 仅提供此安装器支持的 x86_64 / aarch64 发布包: $(uname -m)" ;;
     esac
 
     ok "系统: ${PRETTY_NAME:-$ID}  |  包管理器: ${PKG_MGR}  |  架构: ${ARCH:-unknown}"
@@ -162,15 +179,18 @@ validate_config() {
 
     [[ "${PANEL_PORT}" =~ ^[0-9]+$ ]] || die "面板端口必须为数字: ${PANEL_PORT}"
     [[ "${SUB_PORT}"   =~ ^[0-9]+$ ]] || die "订阅端口必须为数字: ${SUB_PORT}"
+    [[ "${RATHOLE_TUNNEL_PORT}" =~ ^[0-9]+$ ]] || die "rathole 客户端端口必须为数字: ${RATHOLE_TUNNEL_PORT}"
     (( PANEL_PORT >= 1 && PANEL_PORT <= 65535 )) || die "面板端口必须在 1-65535 之间: ${PANEL_PORT}"
     (( SUB_PORT >= 1 && SUB_PORT <= 65535 )) || die "订阅端口必须在 1-65535 之间: ${SUB_PORT}"
+    (( RATHOLE_TUNNEL_PORT >= 1 && RATHOLE_TUNNEL_PORT <= 65535 )) || die "rathole 客户端端口必须在 1-65535 之间"
+    (( RATHOLE_TUNNEL_PORT != 443 && RATHOLE_TUNNEL_PORT != CADDY_HTTPS_PORT && RATHOLE_TUNNEL_PORT != 80 )) || die "rathole 客户端端口不能与 80/443/${CADDY_HTTPS_PORT} 冲突"
 
     if [[ -n "${FALLBACK_URL}" && "${FALLBACK_URL}" != "none" ]]; then
         [[ "${FALLBACK_URL}" =~ ^https?://[^[:space:]{}]+$ ]] \
             || die "兜底跳转地址必须是合法的 http/https URL，或填写 none 关闭: ${FALLBACK_URL}"
     fi
 
-    warn "请确认下列域名的 A/AAAA 记录均已解析到本机公网 IP，否则证书申请会失败："
+    warn "请确认下列 VPS Caddy 域名的 A 记录均已解析到本机公网 IPv4，否则证书申请会失败："
     warn "  面板: ${DOMAIN}${SUB_DOMAIN:+   订阅: ${SUB_DOMAIN}}"
     if [[ "${ASSUME_YES}" -ne 1 ]]; then
         read -rp "确认继续安装? [y/N]: " reply
@@ -225,8 +245,8 @@ pkg_install() {
 install_common_tools() {
     log "安装常用系统、网络、调试工具..."
     local common=(curl wget vim nano tmux htop unzip tar jq lsof socat traceroute mtr nmap tcpdump telnet iftop nload)
-    local debian_extra=(net-tools iproute2 dnsutils ca-certificates gnupg sqlite3)
-    local rhel_extra=(net-tools iproute bind-utils ca-certificates sqlite)
+    local debian_extra=(net-tools iproute2 dnsutils ca-certificates gnupg sqlite3 passwd)
+    local rhel_extra=(net-tools iproute bind-utils ca-certificates sqlite shadow-utils)
 
     if [[ "${OS_FAMILY}" == "debian" ]]; then
         pkg_install "${common[@]}" "${debian_extra[@]}"
@@ -449,19 +469,218 @@ install_caddy() {
 }
 
 # ---------------------------------------------------------------------------
+# rathole 服务端：固定版本、Noise NK、独立低权限 systemd 服务
+# ---------------------------------------------------------------------------
+port_listener() {
+    ss -H -ltnp "( sport = :$1 )" 2>/dev/null || true
+}
+
+check_port_owner() {
+    local port="$1" allowed="$2" listener
+    listener="$(port_listener "${port}")"
+    if [[ -n "${listener}" && "${listener}" != *\"${allowed}\"* ]]; then
+        die "TCP ${port} 已被其他进程占用：${listener}；请先迁移该服务的监听端口"
+    fi
+}
+
+preflight_ports() {
+    command -v ss >/dev/null 2>&1 || die "缺少 ss，无法检查 443/${CADDY_HTTPS_PORT}/${RATHOLE_TUNNEL_PORT} 端口占用"
+    local listener
+    listener="$(port_listener 443)"
+    if [[ -n "${listener}" && "${listener}" != *'"caddy"'* ]]; then
+        if [[ "${listener}" != *'"rathole"'* ]] || [[ ! -f "${RATHOLE_UNIT}" ]] \
+            || ! grep -Fq 'Managed by xLink-Installer' "${RATHOLE_UNIT}"; then
+            die "TCP 443 已被其他服务占用：${listener}；请先迁移梯子/其他服务到非 443 端口"
+        fi
+    fi
+    check_port_owner "${CADDY_HTTPS_PORT}" caddy
+    check_port_owner "${RATHOLE_TUNNEL_PORT}" rathole
+    check_port_owner 80 caddy
+}
+
+install_rathole_binary() {
+    local asset checksum binary_checksum archive extracted actual
+    case "${ARCH}" in
+        amd64) asset="rathole-x86_64-unknown-linux-gnu.zip"; checksum="${RATHOLE_AMD64_SHA256}"; binary_checksum="${RATHOLE_AMD64_BIN_SHA256}" ;;
+        arm64) asset="rathole-aarch64-unknown-linux-musl.zip"; checksum="${RATHOLE_ARM64_SHA256}"; binary_checksum="${RATHOLE_ARM64_BIN_SHA256}" ;;
+    esac
+    if [[ -x "${RATHOLE_BIN}" ]]; then
+        actual="$(sha256sum "${RATHOLE_BIN}" | awk '{print $1}')"
+        if [[ "${actual}" == "${binary_checksum}" ]] && { [[ ! -e "${RATHOLE_UNIT}" ]] \
+            || grep -Fq 'Managed by xLink-Installer' "${RATHOLE_UNIT}"; }; then
+            ok "检测到校验匹配的 rathole ${RATHOLE_VERSION} 二进制，保留已有版本"
+            return 0
+        fi
+        die "检测到版本/校验不符或非本安装器管理的 ${RATHOLE_BIN}，拒绝覆盖"
+    fi
+    [[ ! -e "${RATHOLE_BIN}" ]] || die "已有不可执行的 ${RATHOLE_BIN}，拒绝覆盖"
+    archive="$(mktemp /tmp/xlink-rathole.XXXXXX.zip)" || die "无法创建 rathole 临时文件"
+    extracted="$(mktemp /tmp/xlink-rathole.XXXXXX.bin)" || { rm -f "${archive}"; die "无法创建 rathole 临时文件"; }
+    if ! curl -fLsS --retry 3 "https://github.com/rathole-org/rathole/releases/download/${RATHOLE_VERSION}/${asset}" -o "${archive}"; then
+        rm -f "${archive}" "${extracted}"
+        die "下载 rathole ${RATHOLE_VERSION} 失败"
+    fi
+    actual="$(sha256sum "${archive}" | awk '{print $1}')"
+    if [[ "${actual}" != "${checksum}" ]] || ! unzip -p "${archive}" rathole > "${extracted}"; then
+        rm -f "${archive}" "${extracted}"
+        die "rathole 发布包校验或解压失败，未执行下载内容"
+    fi
+    install -m 755 "${extracted}" "${RATHOLE_BIN}"
+    rm -f "${archive}" "${extracted}"
+    ok "rathole ${RATHOLE_VERSION} 安装完成"
+}
+
+configure_rathole() {
+    local keypair private_key public_key token nologin_shell
+    if [[ -e "${RATHOLE_UNIT}" ]] && ! grep -Fq 'Managed by xLink-Installer' "${RATHOLE_UNIT}"; then
+        die "已有非 xLink 管理的 rathole.service，拒绝覆盖"
+    fi
+    if [[ -e "${RATHOLE_CONFIG}" ]] && ! grep -Fq 'Managed by xLink-Installer' "${RATHOLE_CONFIG}"; then
+        die "已有非 xLink 管理的 ${RATHOLE_CONFIG}，拒绝覆盖"
+    fi
+    if [[ -e "${RATHOLE_UNIT}" && ! -e "${RATHOLE_CONFIG}" ]]; then
+        die "rathole 服务文件存在但服务端配置缺失，请先检查现有安装，拒绝重置密钥"
+    fi
+    if [[ -e "${RATHOLE_CONFIG}" ]] && ! grep -Fq "bind_addr = \"0.0.0.0:${RATHOLE_TUNNEL_PORT}\"" "${RATHOLE_CONFIG}"; then
+        die "现有 rathole 客户端连接端口与 --rathole-port 不符；请检查 ${RATHOLE_CONFIG}"
+    fi
+    command -v groupadd >/dev/null 2>&1 && command -v useradd >/dev/null 2>&1 \
+        || die "缺少 groupadd/useradd，无法创建 rathole 受限账户"
+    nologin_shell="$(command -v nologin || true)"
+    [[ -n "${nologin_shell}" ]] || nologin_shell="/bin/false"
+    if ! getent group rathole >/dev/null; then groupadd --system rathole; fi
+    if ! id -u rathole >/dev/null 2>&1; then
+        useradd --system --gid rathole --no-create-home --shell "${nologin_shell}" rathole
+    fi
+    install -d -m 750 -o root -g rathole /etc/rathole
+    if [[ ! -e "${RATHOLE_CONFIG}" ]]; then
+        keypair="$("${RATHOLE_BIN}" --genkey 2>&1)" || die "rathole Noise 密钥生成失败"
+        private_key="$(printf '%s\n' "${keypair}" | awk '/^Private Key:/{getline;print;exit}')"
+        public_key="$(printf '%s\n' "${keypair}" | awk '/^Public Key:/{getline;print;exit}')"
+        [[ "${private_key}" =~ ^[A-Za-z0-9+/]{43}=$ && "${public_key}" =~ ^[A-Za-z0-9+/]{43}=$ ]] \
+            || die "rathole --genkey 输出格式不符合预期"
+        token="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
+        [[ "${token}" =~ ^[0-9a-f]{64}$ ]] || die "rathole token 生成失败"
+        ( umask 077; cat > "${RATHOLE_CONFIG}" <<EOF
+# Managed by xLink-Installer; do not publish this file (contains Noise private key and token).
+[server]
+bind_addr = "0.0.0.0:${RATHOLE_TUNNEL_PORT}"
+
+[server.transport]
+type = "noise"
+
+[server.transport.noise]
+local_private_key = "${private_key}"
+
+[server.services.internal_https]
+type = "tcp"
+token = "${token}"
+bind_addr = "0.0.0.0:443"
+EOF
+        )
+        chown root:rathole "${RATHOLE_CONFIG}"
+        chmod 640 "${RATHOLE_CONFIG}"
+        ( umask 077; cat > "${RATHOLE_CLIENT_EXAMPLE}" <<EOF
+# Copy securely to the internal host; replace the endpoint with an unproxied VPS IP/DNS name.
+[client]
+remote_addr = "REPLACE_WITH_VPS_IP_OR_DNS:${RATHOLE_TUNNEL_PORT}"
+
+[client.transport]
+type = "noise"
+
+[client.transport.noise]
+remote_public_key = "${public_key}"
+
+[client.services.internal_https]
+type = "tcp"
+token = "${token}"
+local_addr = "127.0.0.1:443"
+EOF
+        )
+        chmod 600 "${RATHOLE_CLIENT_EXAMPLE}"
+        ok "已生成 rathole Noise 配置及客户端示例（仅 root 可读取客户端示例）"
+    else
+        chown root:rathole "${RATHOLE_CONFIG}"
+        chmod 640 "${RATHOLE_CONFIG}"
+        ok "保留现有 rathole 密钥与 token，不会在重跑时轮换"
+    fi
+    cat > "${RATHOLE_UNIT}" <<EOF
+# Managed by xLink-Installer
+[Unit]
+Description=rathole Noise TCP tunnel server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=rathole
+Group=rathole
+ExecStart=${RATHOLE_BIN} --server ${RATHOLE_CONFIG}
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65535
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+}
+
+start_rathole() {
+    local i
+    if [[ -n "$(port_listener 443)" && "$(port_listener 443)" != *'"rathole"'* ]]; then
+        warn "TCP 443 尚未从 Caddy 或其他服务释放：$(port_listener 443)"
+        return 1
+    fi
+    systemctl enable rathole >/dev/null || return 1
+    systemctl restart rathole || return 1
+    for ((i = 1; i <= 10; i++)); do
+        if systemctl is-active --quiet rathole && [[ "$(port_listener 443)" == *'"rathole"'* ]] \
+            && [[ "$(port_listener "${RATHOLE_TUNNEL_PORT}")" == *'"rathole"'* ]]; then
+            ok "rathole 已开机自启，监听公网 TCP 443 与 ${RATHOLE_TUNNEL_PORT}"
+            return 0
+        fi
+        sleep 1
+    done
+    warn "rathole 未正常监听，请查看 journalctl -u rathole -e"
+    return 1
+}
+
+# ---------------------------------------------------------------------------
 # Caddy 反向代理配置（自动 HTTPS）
 # ---------------------------------------------------------------------------
+restore_caddy() {
+    if (( CADDY_MAIN_EXISTED )); then
+        cp -a "${CADDYFILE}.bak.${CADDY_BACKUP_STAMP}" "${CADDYFILE}"
+    else
+        rm -f "${CADDYFILE}"
+    fi
+    if (( CADDY_SNIPPET_EXISTED )); then
+        cp -a "${CADDY_SNIPPET}.bak.${CADDY_BACKUP_STAMP}" "${CADDY_SNIPPET}"
+    else
+        rm -f "${CADDY_SNIPPET}"
+    fi
+    systemctl restart caddy >/dev/null 2>&1 || warn "原 Caddy 配置已恢复，但重启失败，请查看 journalctl -u caddy -e"
+}
+
 configure_caddy() {
-    local stamp main_existed=0 snippet_existed=0 tmp_snippet
-    stamp="$(date +%Y%m%d%H%M%S)"
+    local tmp_snippet
+    CADDY_BACKUP_STAMP="$(date +%Y%m%d%H%M%S).$$"
     tmp_snippet="${CADDY_SNIPPET}.tmp.$$"
     log "写入 xLink 独立 Caddy 配置: ${CADDY_SNIPPET}"
     mkdir -p "$(dirname "${CADDYFILE}")" "${CADDY_CONF_DIR}"
 
-    [[ -f "${CADDYFILE}" ]] && main_existed=1
-    [[ -f "${CADDY_SNIPPET}" ]] && snippet_existed=1
-    (( main_existed )) && cp -a "${CADDYFILE}" "${CADDYFILE}.bak.${stamp}"
-    (( snippet_existed )) && cp -a "${CADDY_SNIPPET}" "${CADDY_SNIPPET}.bak.${stamp}"
+    [[ -f "${CADDYFILE}" ]] && CADDY_MAIN_EXISTED=1
+    [[ -f "${CADDY_SNIPPET}" ]] && CADDY_SNIPPET_EXISTED=1
+    (( CADDY_MAIN_EXISTED )) && cp -a "${CADDYFILE}" "${CADDYFILE}.bak.${CADDY_BACKUP_STAMP}"
+    (( CADDY_SNIPPET_EXISTED )) && cp -a "${CADDY_SNIPPET}" "${CADDY_SNIPPET}.bak.${CADDY_BACKUP_STAMP}"
 
     {
         echo "# 由 ${SCRIPT_NAME} 管理；其他服务请使用 conf.d 下的独立 .caddy 文件"
@@ -478,7 +697,7 @@ configure_caddy() {
     chmod 644 "${tmp_snippet}"
     mv -f "${tmp_snippet}" "${CADDY_SNIPPET}"
 
-    if (( ! main_existed )); then
+    if (( ! CADDY_MAIN_EXISTED )); then
         printf '# Caddy 主配置：自动加载各服务的独立配置片段\nimport %s/*.caddy\n' \
             "${CADDY_CONF_DIR}" > "${CADDYFILE}"
     elif ! grep -Fq "import ${CADDY_CONF_DIR}/*.caddy" "${CADDYFILE}"; then
@@ -487,35 +706,16 @@ configure_caddy() {
     fi
 
     if ! caddy validate --config "${CADDYFILE}" --adapter caddyfile; then
-        if (( main_existed )); then
-            cp -a "${CADDYFILE}.bak.${stamp}" "${CADDYFILE}"
-        else
-            rm -f "${CADDYFILE}"
-        fi
-        if (( snippet_existed )); then
-            cp -a "${CADDY_SNIPPET}.bak.${stamp}" "${CADDY_SNIPPET}"
-        else
-            rm -f "${CADDY_SNIPPET}"
-        fi
+        restore_caddy
         die "Caddy 配置校验失败，已恢复修改前的配置"
     fi
 
     systemctl enable caddy >/dev/null 2>&1 || true
     if ! systemctl restart caddy; then
-        if (( main_existed )); then
-            cp -a "${CADDYFILE}.bak.${stamp}" "${CADDYFILE}"
-        else
-            rm -f "${CADDYFILE}"
-        fi
-        if (( snippet_existed )); then
-            cp -a "${CADDY_SNIPPET}.bak.${stamp}" "${CADDY_SNIPPET}"
-        else
-            rm -f "${CADDY_SNIPPET}"
-        fi
-        systemctl restart caddy >/dev/null 2>&1 || true
+        restore_caddy
         die "Caddy 启动失败，已恢复修改前的配置；请查看 journalctl -u caddy"
     fi
-    ok "Caddy 已启动并将自动为 ${DOMAIN}${SUB_DOMAIN:+ 、${SUB_DOMAIN}} 申请证书"
+    ok "Caddy 已启动于 HTTPS :${CADDY_HTTPS_PORT}，将通过公网 80 的 HTTP-01 为 ${DOMAIN}${SUB_DOMAIN:+ 、${SUB_DOMAIN}} 申请证书"
 }
 
 # 生成单个 Caddy 站点块，并显式保留该域名的 HTTP -> HTTPS 跳转。
@@ -528,11 +728,16 @@ caddy_site_block() {
     fi
     cat <<EOF
 http://${domain} {
-    redir https://${domain}{uri} 308
+    redir https://${domain}:${CADDY_HTTPS_PORT}{uri} 308
 }
 
-${domain} {
+https://${domain}:${CADDY_HTTPS_PORT} {
     encode zstd gzip
+    tls {
+        issuer acme {
+            disable_tlsalpn_challenge
+        }
+    }
     reverse_proxy ${upstream} {
         header_up Host {host}
         header_up X-Real-IP {remote_host}
@@ -573,7 +778,8 @@ wait_for_port() {
         fi
         sleep 1
     done
-    warn "未检测到${label}端口 ${port} 监听，Caddy 可能返回 502；请检查 'x-ui status' 与端口设置"
+    warn "未检测到${label}端口 ${port} 监听，停止部署以避免 Caddy 返回 502；请检查 'x-ui status' 与端口设置"
+    return 1
 }
 
 wait_for_panel() {
@@ -584,24 +790,25 @@ wait_for_panel() {
 }
 
 # ---------------------------------------------------------------------------
-# 防火墙配置：放行 80 / 443
+# 防火墙配置：80 为 VPS Caddy ACME，443 为内网穿透，9443 为 VPS Caddy
 # ---------------------------------------------------------------------------
 configure_firewall() {
-    log "配置防火墙放行 80/443..."
-    if command -v ufw >/dev/null 2>&1 && ufw status >/dev/null 2>&1; then
-        ufw allow 80/tcp   >/dev/null 2>&1 || true
-        ufw allow 443/tcp  >/dev/null 2>&1 || true
-        ufw allow 443/udp  >/dev/null 2>&1 || true   # HTTP/3
-        ok "已通过 ufw 放行 80/443"
+    local port failed=0
+    log "配置防火墙放行 TCP 80/443/${CADDY_HTTPS_PORT}/${RATHOLE_TUNNEL_PORT}..."
+    if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then
+        for port in 80 443 "${CADDY_HTTPS_PORT}" "${RATHOLE_TUNNEL_PORT}"; do
+            ufw allow "${port}/tcp" >/dev/null 2>&1 || { warn "ufw 放行 TCP ${port} 失败"; failed=1; }
+        done
     elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-        firewall-cmd --permanent --add-service=http    >/dev/null 2>&1 || true
-        firewall-cmd --permanent --add-service=https   >/dev/null 2>&1 || true
-        firewall-cmd --permanent --add-port=443/udp    >/dev/null 2>&1 || true
-        firewall-cmd --reload >/dev/null 2>&1 || true
-        ok "已通过 firewalld 放行 80/443"
+        for port in 80 443 "${CADDY_HTTPS_PORT}" "${RATHOLE_TUNNEL_PORT}"; do
+            firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 || { warn "firewalld 放行 TCP ${port} 失败"; failed=1; }
+        done
+        firewall-cmd --reload >/dev/null 2>&1 || { warn "firewalld 重新加载失败"; failed=1; }
     else
-        warn "未检测到启用的防火墙(ufw/firewalld)，请自行确认云厂商安全组已放行 80/443"
+        warn "未检测到启用的防火墙，请确认云安全组已放行 TCP 80/443/${CADDY_HTTPS_PORT}/${RATHOLE_TUNNEL_PORT}"
+        return 0
     fi
+    (( failed == 0 )) && ok "本机防火墙端口已放行" || warn "部分端口放行失败，请手动检查防火墙"
 }
 
 # ---------------------------------------------------------------------------
@@ -698,25 +905,30 @@ print_summary() {
 ${C_OK}============================================================${C_RESET}
  ${SCRIPT_NAME} 部署完成
 ${C_OK}============================================================${C_RESET}
-  面板访问地址 : https://${DOMAIN}${XUI_PATH:-/}
+  面板访问地址 : https://${DOMAIN}:${CADDY_HTTPS_PORT}${XUI_PATH:-/}
   面板代理目标 : 127.0.0.1:${PANEL_PORT}  (监听 ${XUI_LISTEN:-0.0.0.0})
 EOF
 
     if [[ -n "${SUB_DOMAIN}" ]]; then
         cat <<EOF
-  订阅访问地址 : https://${SUB_DOMAIN}${XUI_SUB_PATH:-/}
+  订阅访问地址 : https://${SUB_DOMAIN}:${CADDY_HTTPS_PORT}${XUI_SUB_PATH:-/}
   订阅代理目标 : 127.0.0.1:${SUB_PORT}  (监听 ${XUI_SUB_LISTEN:-0.0.0.0}, 启用=${XUI_SUB_ENABLE:-未知})
 EOF
     fi
 
     cat <<EOF
   服务器 IP    : ${ip}
+  内网 HTTPS   : 公网 TCP 443 → rathole → 内网 Caddy :443
+  隧道连接端口 : TCP ${RATHOLE_TUNNEL_PORT} (Noise)
+  rathole 服务 : systemctl status rathole
+  客户端配置   : ${RATHOLE_CLIENT_EXAMPLE} (仅 root 可读，先替换 VPS 地址再安全复制到内网)
   系统时区     : ${TIMEZONE}
   IP直连处理   : $(if [[ -n "${FALLBACK_URL}" && "${FALLBACK_URL}" != "none" ]]; then printf '直接访问 IP/未知域名 → 跳转 %s' "${FALLBACK_URL}"; else printf '未启用兜底跳转'; fi)
 
   管理 3x-ui   : 运行命令  x-ui
   查看面板凭据 : x-ui  ->  查看当前面板设置
   Caddy 日志   : journalctl -u caddy -f
+  rathole 日志 : journalctl -u rathole -f
   Caddy 配置   : ${CADDYFILE}
   安装日志     : ${LOG_FILE}
 EOF
@@ -729,8 +941,10 @@ EOF
 
   提示:
    - 访问地址已包含随机路径 ${XUI_PATH:-/}，缺少路径会返回 404
-   - 首次访问 https 需等待证书签发(通常几秒~1分钟)
-   - 请为所有域名(面板${SUB_DOMAIN:+、订阅})都配置解析并确保安全组放行 80/443
+   - VPS Caddy 只提供 HTTPS :${CADDY_HTTPS_PORT}；公网 80 用于 HTTP-01 证书验证和跳转
+   - 内网 Caddy 请自行配置 DNS-01 证书与域名分流；客户端启动前 443 只有入口、不会有后端
+   - 梯子原先占用 443 的 inbound 请先迁移至 ${CADDY_HTTPS_PORT} 或其他端口，并更新客户端
+   - 确保安全组放行 TCP 80/443/${CADDY_HTTPS_PORT}/${RATHOLE_TUNNEL_PORT}（不需要 UDP 443）
    - 面板已绑定 ${XUI_LISTEN:-0.0.0.0}；若非 127.0.0.1，请勿在安全组放行面板/订阅端口${SUB_DOMAIN:+
    - 订阅需在 3x-ui『订阅设置』中开启后方可使用}
 ${C_OK}============================================================${C_RESET}
@@ -744,7 +958,7 @@ EOF
 on_error() {
     local line="$1"
     err "安装在第 ${line} 行中断。查看日志: ${LOG_FILE}"
-    err "排查命令: 'x-ui status'、'journalctl -u caddy -e'"
+    err "排查命令: 'x-ui status'、'journalctl -u caddy -e'、'journalctl -u rathole -e'"
 }
 
 setup_logging() {
@@ -767,14 +981,22 @@ main() {
 
     pkg_update
     install_common_tools
+    preflight_ports
     optimize_system
     enable_bbr
     install_xui
     read_xui_settings
-    bind_xui_localhost
     install_caddy
+    install_rathole_binary
+    configure_rathole
     wait_for_panel
     configure_caddy
+    if ! start_rathole; then
+        systemctl disable --now rathole >/dev/null 2>&1 || true
+        restore_caddy
+        die "rathole 未能接管 443；已恢复原 Caddy 配置，请查看 journalctl -u rathole -e"
+    fi
+    bind_xui_localhost
     configure_firewall
     print_summary
 }
