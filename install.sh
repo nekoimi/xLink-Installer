@@ -29,6 +29,7 @@ readonly XUI_INSTALL_URL="https://raw.githubusercontent.com/MHSanaei/3x-ui/${XUI
 readonly CADDYFILE="/etc/caddy/Caddyfile"
 readonly CADDY_CONF_DIR="/etc/caddy/conf.d"
 readonly CADDY_SNIPPET="${CADDY_CONF_DIR}/xlink.caddy"
+readonly CADDY_UNIT="/etc/systemd/system/caddy.service"
 readonly LOG_FILE="/var/log/xlink-install.log"
 readonly XUI_DB="/etc/x-ui/x-ui.db"
 readonly XUI_BIN="/usr/local/x-ui/x-ui"
@@ -449,6 +450,61 @@ caddy_service_exists() {
     systemctl cat caddy.service >/dev/null 2>&1
 }
 
+install_caddy_service_fallback() {
+    local caddy_bin nologin_shell
+    caddy_bin="$(command -v caddy)"
+    [[ -x "${caddy_bin}" ]] && caddy version >/dev/null 2>&1 \
+        || die "Caddy 二进制不可执行，无法创建 systemd 服务"
+    if [[ -e "${CADDY_UNIT}" ]]; then
+        die "${CADDY_UNIT} 已存在但 systemd 无法识别，拒绝覆盖；请检查该文件后重试"
+    fi
+    command -v groupadd >/dev/null 2>&1 && command -v useradd >/dev/null 2>&1 \
+        || die "缺少 groupadd/useradd，无法创建 Caddy 服务账户"
+    nologin_shell="$(command -v nologin || true)"
+    [[ -n "${nologin_shell}" ]] || nologin_shell="/bin/false"
+    if ! getent group caddy >/dev/null; then groupadd --system caddy; fi
+    if ! id -u caddy >/dev/null 2>&1; then
+        useradd --system --gid caddy --home-dir /var/lib/caddy --no-create-home --shell "${nologin_shell}" caddy
+    fi
+    install -d -m 755 -o root -g root /etc/caddy
+    install -d -m 750 -o caddy -g caddy /var/lib/caddy /var/log/caddy
+    cat > "${CADDY_UNIT}" <<EOF
+# Managed by xLink-Installer; fallback for distributions whose Caddy package has no unit.
+[Unit]
+Description=Caddy web server
+Documentation=https://caddyserver.com/docs/
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+User=caddy
+Group=caddy
+Environment=XDG_DATA_HOME=/var/lib/caddy
+Environment=XDG_CONFIG_HOME=/var/lib/caddy
+ExecStart=${caddy_bin} run --environ --config ${CADDYFILE}
+ExecReload=${caddy_bin} reload --config ${CADDYFILE} --force
+TimeoutStopSec=5s
+LimitNOFILE=1048576
+Restart=on-failure
+RestartSec=5s
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 "${CADDY_UNIT}"
+    systemctl daemon-reload
+    caddy_service_exists || die "已生成 ${CADDY_UNIT}，但 systemd 仍无法识别 caddy.service"
+    ok "软件包未提供 caddy.service，已自动创建 systemd 服务"
+}
+
 install_caddy() {
     local key_tmp repo_tmp
     command -v systemctl >/dev/null 2>&1 || die "系统缺少 systemctl，无法安装并管理 Caddy 服务"
@@ -477,15 +533,15 @@ install_caddy() {
         install -m 644 "${repo_tmp}" /etc/apt/sources.list.d/caddy-stable.list
         rm -f "${key_tmp}" "${repo_tmp}"
         pkg_update
-        pkg_install caddy
+        DEBIAN_FRONTEND=noninteractive apt-get install -y caddy || die "通过 Caddy 官方软件源安装失败"
     else
         pkg_install 'dnf-command(copr)' || true
         "${PKG_MGR}" copr enable -y @caddy/caddy || warn "copr 启用失败，尝试直接安装"
-        pkg_install caddy
+        "${PKG_MGR}" install -y caddy || die "通过 Caddy COPR 软件源安装失败"
     fi
     command -v caddy >/dev/null 2>&1 || die "Caddy 安装失败"
     systemctl daemon-reload
-    caddy_service_exists || die "Caddy 二进制已安装，但未找到 caddy.service"
+    caddy_service_exists || install_caddy_service_fallback
     systemctl enable caddy.service >/dev/null 2>&1 || die "Caddy 设置开机自启失败"
     ok "Caddy 在线安装完成，systemd 服务已设置为开机自启"
 }
