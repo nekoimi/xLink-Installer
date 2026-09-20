@@ -720,14 +720,19 @@ start_rathole() {
     systemctl enable rathole >/dev/null || return 1
     systemctl restart rathole || return 1
     for ((i = 1; i <= 10; i++)); do
-        if systemctl is-active --quiet rathole && [[ "$(port_listener 443)" == *'"rathole"'* ]] \
+        if systemctl is-active --quiet rathole \
             && [[ "$(port_listener "${RATHOLE_TUNNEL_PORT}")" == *'"rathole"'* ]]; then
-            ok "rathole 已开机自启，监听公网 TCP 443 与 ${RATHOLE_TUNNEL_PORT}"
+            ok "rathole 已开机自启，Noise 控制端口 TCP ${RATHOLE_TUNNEL_PORT} 正常监听"
+            if [[ "$(port_listener 443)" == *'"rathole"'* ]]; then
+                ok "内网客户端已连接，rathole 业务入口 TCP 443 正常监听"
+            else
+                warn "内网 rathole-client 尚未连接；客户端认证成功后，服务端才会开始监听 TCP 443（这是正常行为）"
+            fi
             return 0
         fi
         sleep 1
     done
-    warn "rathole 未正常监听，请查看 journalctl -u rathole -e"
+    warn "rathole 服务未保持 active 或控制端口 ${RATHOLE_TUNNEL_PORT} 未监听，请查看 journalctl -u rathole -e"
     return 1
 }
 

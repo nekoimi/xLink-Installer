@@ -113,7 +113,7 @@ sudo bash install.sh -d panel.example.com -s sub.example.com -y
 
 脚本只安装公网 VPS 上的 rathole-server，不会连接或修改内网机器。安装完成后，以安全方式将 VPS 的 `/etc/rathole/client-example.toml` 复制到内网机器，替换其中 `REPLACE_WITH_VPS_IP_OR_DNS` 为 VPS 的公网 IP 或不经过 CDN 代理的 DNS 名称。示例的 `local_addr = "127.0.0.1:443"` 要与内网 Caddy 的监听地址一致；若 Caddy 在另一台内网机器上，填其可达的内网 IP。保持配置文件权限 `600`，然后在内网机器安装相同版本的 rathole 并运行 `rathole --client client.toml`（建议自行配置 systemd）。
 
-内网 Caddy 负责申请并持有业务域名证书，需使用 DNS-01；普通 Caddy 安装包可能没有对应 DNS 提供商模块，需要按提供商另行准备。业务域名解析到 VPS 公网 IP。rathole 转发的是原始 TCP，不在 VPS 上解密 HTTPS；内网客户端尚未连接时，公网 TCP 443 虽可建立连接但业务不可用。服务端重跑不会轮换已有 Noise 密钥/token，也不会覆盖现有客户端示例。
+内网 Caddy 负责申请并持有业务域名证书，需使用 DNS-01；普通 Caddy 安装包可能没有对应 DNS 提供商模块，需要按提供商另行准备。业务域名解析到 VPS 公网 IP。rathole 转发的是原始 TCP，不在 VPS 上解密 HTTPS。rathole-server 启动时先监听 Noise 控制端口（默认 2333）；只有内网客户端成功连接并认证 `internal_https` 服务后，才会开始监听公网 TCP 443。因此客户端未连接时 443 未监听属于正常行为。服务端重跑不会轮换已有 Noise 密钥/token，也不会覆盖现有客户端示例。
 
 ## 后续增加 Caddy 反向代理服务
 
