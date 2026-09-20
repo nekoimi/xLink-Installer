@@ -445,18 +445,37 @@ bind_xui_localhost() {
 # ---------------------------------------------------------------------------
 # Caddy 安装
 # ---------------------------------------------------------------------------
+caddy_service_exists() {
+    systemctl cat caddy.service >/dev/null 2>&1
+}
+
 install_caddy() {
-    if command -v caddy >/dev/null 2>&1; then
-        ok "检测到 Caddy 已安装，跳过安装步骤"
+    local key_tmp repo_tmp
+    command -v systemctl >/dev/null 2>&1 || die "系统缺少 systemctl，无法安装并管理 Caddy 服务"
+
+    if command -v caddy >/dev/null 2>&1 && caddy_service_exists; then
+        systemctl enable caddy.service >/dev/null 2>&1 || die "Caddy 已安装，但设置开机自启失败"
+        ok "检测到 Caddy 及 systemd 服务，已确认开机自启"
         return 0
     fi
-    log "安装 Caddy..."
+    if command -v caddy >/dev/null 2>&1; then
+        warn "检测到 Caddy 二进制但没有 caddy.service，将通过官方软件源补全 systemd 安装"
+    else
+        log "未检测到 Caddy，使用官方软件源在线安装..."
+    fi
     if [[ "${OS_FAMILY}" == "debian" ]]; then
         pkg_install debian-keyring debian-archive-keyring apt-transport-https
-        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
-            | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
-            > /etc/apt/sources.list.d/caddy-stable.list
+        command -v gpg >/dev/null 2>&1 || die "缺少 gpg，无法验证 Caddy 官方软件源"
+        key_tmp="$(mktemp /tmp/caddy-key.XXXXXX)" || die "无法创建 Caddy 软件源临时文件"
+        repo_tmp="$(mktemp /tmp/caddy-repo.XXXXXX)" || { rm -f "${key_tmp}"; die "无法创建 Caddy 软件源临时文件"; }
+        if ! curl -fLsS 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' -o "${key_tmp}" \
+            || ! gpg --batch --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg "${key_tmp}" \
+            || ! curl -fLsS 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' -o "${repo_tmp}"; then
+            rm -f "${key_tmp}" "${repo_tmp}"
+            die "配置 Caddy 官方软件源失败"
+        fi
+        install -m 644 "${repo_tmp}" /etc/apt/sources.list.d/caddy-stable.list
+        rm -f "${key_tmp}" "${repo_tmp}"
         pkg_update
         pkg_install caddy
     else
@@ -465,7 +484,10 @@ install_caddy() {
         pkg_install caddy
     fi
     command -v caddy >/dev/null 2>&1 || die "Caddy 安装失败"
-    ok "Caddy 安装完成"
+    systemctl daemon-reload
+    caddy_service_exists || die "Caddy 二进制已安装，但未找到 caddy.service"
+    systemctl enable caddy.service >/dev/null 2>&1 || die "Caddy 设置开机自启失败"
+    ok "Caddy 在线安装完成，systemd 服务已设置为开机自启"
 }
 
 # ---------------------------------------------------------------------------

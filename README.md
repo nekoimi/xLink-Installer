@@ -15,7 +15,8 @@
 - 新安装由 Caddy 统一终止 TLS；已有 3x-ui 若配置了证书，会自动使用 HTTPS 上游兼容现有配置
 - 安装后自动回读面板真实端口与访问路径，并据此配置 Caddy（不再写死端口）
 - 将面板绑定到 `127.0.0.1`，经 VPS Caddy 的 HTTPS `:9443` 访问
-- 安装并配置 Caddy，通过公网 TCP 80 的 HTTP-01 验证申请证书；xLink 使用独立配置片段，不覆盖已有站点
+- 检查 Caddy 可执行文件和 `caddy.service`；缺少任一项时通过官方软件源在线安装，并设置 systemd 开机自启
+- 配置 Caddy 通过公网 TCP 80 的 HTTP-01 验证申请证书；xLink 使用独立配置片段，不覆盖已有站点
 - 固定版本并校验 SHA-256 安装 rathole，使用 Noise NK 加密隧道；服务端由受限账户运行，通过 systemd 开机自启
 - 面板与订阅使用**分开的两个域名**，各自反代到对应端口（面板默认 2053 / 订阅默认 2096，均自动回读）
 - 自动放行防火墙 TCP 80、443、9443 和隧道端口（ufw / firewalld）
@@ -99,6 +100,7 @@ sudo bash install.sh -d panel.example.com -s sub.example.com -y
 - 登录凭据：3x-ui 安装时随机生成，脚本会尽力从安装日志中回显；也可运行 `x-ui` 查看当前设置
 - 管理 3x-ui：终端运行 `x-ui`（查看/修改凭据、端口等）
 - 查看 Caddy 日志：`journalctl -u caddy -f`
+- Caddy 服务状态：`systemctl status caddy`（安装器会执行 `systemctl enable caddy`）
 - rathole 服务状态：`systemctl status rathole`；日志：`journalctl -u rathole -f`
 - rathole 服务端配置：`/etc/rathole/server.toml`（含私钥和 token，勿公开）
 - 内网客户端示例：`/etc/rathole/client-example.toml`（仅 root 可读，含 token）
