@@ -1,6 +1,6 @@
 services:
   xlink:
-    image: ${XLINK_IMAGE:-ghcr.io/nekoimi/xlink-installer:latest}
+    image: ${XLINK_IMAGE:-ghcr.io/nekoimi/xlink-runtime:latest}
     container_name: xlink
     restart: unless-stopped
     stop_grace_period: 15s

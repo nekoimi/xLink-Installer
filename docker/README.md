@@ -24,7 +24,9 @@ docker compose up -d
 docker compose logs -f
 ```
 
-示例镜像地址为 `ghcr.io/nekoimi/xlink-installer:latest`，需要 GitHub Actions 首次成功发布后才可拉取。Fork 仓库时将 `.env` 中的 `XLINK_IMAGE` 改为 `ghcr.io/<小写 owner>/<小写 repo>:latest`。私有镜像需要先使用具有 `read:packages` 权限的 GitHub token 执行 `docker login ghcr.io`。
+示例镜像地址为 `ghcr.io/nekoimi/xlink-runtime:latest`，需要 GitHub Actions 首次成功发布后才可拉取。Fork 仓库时需同时修改 workflow 的 `images` 和 `.env` 中的 `XLINK_IMAGE`，例如发布到 `ghcr.io/<小写 owner>/xlink-runtime`，运行时使用相应的镜像标签。私有镜像需要先使用具有 `read:packages` 权限的 GitHub token 执行 `docker login ghcr.io`。
+
+如果之前已复制 `.env.example` 为 `.env`，请将已有 `.env` 中的 `XLINK_IMAGE` 同步改为新镜像地址；该变量会覆盖 Compose 的默认值。
 
 只有 `PUBLIC_HOST` 必填，不带协议、路径或端口。云安全组放行 TCP **8443、2333、443**（自定义端口时以实际配置为准）。REALITY 目标默认使用 `www.microsoft.com:443`，部署前确认 VPS 可以连接该目标，支持 TLS 1.3 和 HTTP/2；按实际网络情况调整 `REALITY_SERVER_NAME` 和 `REALITY_TARGET`。服务器与代理客户端的系统时间应准确。
 
@@ -48,7 +50,7 @@ docker compose exec xlink python3 /opt/xlink/app.py info
 | `REALITY_SERVER_NAME` | `www.microsoft.com` | REALITY 伪装目标的 TLS SNI |
 | `REALITY_TARGET` | `<REALITY_SERVER_NAME>:443` | 实际 TLS 目标，格式为 `host:port`，IPv6 用 `[地址]:端口` |
 | `TZ` | `Asia/Shanghai` | 容器时区 |
-| `XLINK_IMAGE` | `ghcr.io/nekoimi/xlink-installer:latest` | Compose 使用的镜像，建议生产部署固定发布标签或 digest |
+| `XLINK_IMAGE` | `ghcr.io/nekoimi/xlink-runtime:latest` | Compose 使用的镜像，建议生产部署固定发布标签或 digest |
 
 `XRAY_PORT` / `RATHOLE_PORT` 不能相同，也不能使用固定的内网穿透业务入口 443。Compose 自动按相同的宿主机/容器端口映射；手写 `docker run` 时也应保持一致，以便生成的链接可以直接使用。
 
@@ -111,11 +113,9 @@ docker build -t xlink:local ./docker
 
 仓库包含 `.github/workflows/docker.yml`：
 
-- 推送到 `master` / `main` 且修改 Docker 或 workflow 文件时运行。
-- 推送 `v*` 标签及手动执行时运行。
-- Pull Request 执行构建和测试，不推送镜像。
+- 当前通过 GitHub Actions 页面的 **Docker image → Run workflow** 手动运行，可选择分支或标签。
 - 测试通过后构建并推送 `linux/amd64` 和 `linux/arm64` 镜像。
-- 默认分支生成 `latest`；分支、版本标签、提交 SHA 也有对应镜像标签。
+- 发布到 `ghcr.io/nekoimi/xlink-runtime`。选择默认分支时生成 `latest`；分支、版本标签、提交 SHA 也有对应镜像标签。
 
 使用 GitHub 自动提供的 `GITHUB_TOKEN`，发布 job 声明 `packages: write`，不需要配置个人 token。如果组织策略限制包发布，需要管理员在仓库/组织中允许对应权限。首次发布后如需匿名拉取，在 GitHub Packages 中将镜像可见性设置为 Public；包可能默认是 Private。
 
