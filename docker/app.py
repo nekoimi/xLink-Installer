@@ -141,6 +141,8 @@ def render(data, config, identity):
                     "serverNames": [config["server_name"]],
                     "privateKey": identity["reality_private_key"],
                     "shortIds": [identity["short_id"]],
+                    # Xray expects a string; numeric 0 from a panel export is invalid here.
+                    "minClientVer": "0.0.0",
                 },
             },
         }],

@@ -38,6 +38,8 @@ docker compose exec xlink python3 /opt/xlink/app.py info
 
 链接包含 UUID、REALITY 公钥、short ID、SNI 和 `xtls-rprx-vision`。使用支持 VLESS REALITY/Vision 的客户端。节点凭据不会写入容器启动日志。
 
+REALITY 服务端显式设置 `minClientVer: "0.0.0"`，不设最低客户端版本门槛；这是 Xray 配置中的字符串，不能写成数字 `0`。省略该字段同样不设置最低版本限制。客户端仍需支持 REALITY 和 Vision。
+
 首次运行自动生成并保存 UUID、REALITY 密钥、short ID、Noise 密钥和隧道 token。重启、重建及更新镜像都会复用数据卷中的身份信息。已有身份文件损坏时停止启动，不会悄悄生成新密钥。
 
 ## 配置
