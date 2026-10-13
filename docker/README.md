@@ -94,7 +94,9 @@ docker compose pull
 docker compose up -d
 ```
 
-启动程序让两个服务前台运行并将日志输出到 Docker；任一服务退出都会停止整个容器，交给 `restart: unless-stopped` 重新启动。`docker stop` 会终止并等待子进程退出。健康检查仅验证 Xray 和 Noise 控制端口，不依赖内网客户端在线。Docker 的 unhealthy 状态本身不会触发 restart policy。
+启动程序让两个服务前台运行并将日志输出到 Docker；任一服务退出都会停止整个容器，交给 `restart: unless-stopped` 重新启动。`docker stop` 会终止并等待子进程退出。健康检查通过容器内 `/proc/net/tcp` 和 `/proc/net/tcp6` 验证 Xray 和 Noise 控制端口处于监听状态，不建立连接、不触发 Noise 握手，也不依赖内网客户端在线。Docker 的 unhealthy 状态本身不会触发 restart policy。
+
+旧镜像使用 TCP 连接探测 Noise 端口，每次健康检查连接后立即断开，会产生 `Failed to do noise handshake ... unexpected end of file` 日志。更新镜像后此类自检日志会消失；若仍出现，检查真实客户端的 Noise 配置、公钥和连接端口，也可能是外部端口扫描或其他 TCP 探测造成的。单次握手失败不表示 rathole 服务退出。
 
 BBR、宿主机防火墙、NTP 等需要在宿主机配置。容器无需 `--privileged`、host 网络或 Docker socket；Compose 只保留绑定低端口所需的 `NET_BIND_SERVICE` 能力。
 

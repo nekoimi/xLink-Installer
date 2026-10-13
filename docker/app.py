@@ -8,7 +8,6 @@ from pathlib import Path
 import re
 import secrets
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
@@ -183,11 +182,22 @@ local_addr = "127.0.0.1:443"
     write(data / "health.json", json.dumps({"ports": [config["xray_port"], config["rathole_port"]]}))
 
 
-def healthcheck(data):
+def healthcheck(data, proc_net=Path("/proc/net")):
     config = json.loads((data / "health.json").read_text(encoding="utf-8"))
-    for port in config["ports"]:
-        with socket.create_connection(("127.0.0.1", port), timeout=1):
-            pass
+    listening = set()
+    # Read this network namespace's socket table without opening connections:
+    # a connect-and-close probe causes a Noise handshake error in rathole.
+    for name in ("tcp", "tcp6"):
+        path = proc_net / name
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="ascii").splitlines()[1:]:
+            fields = line.split()
+            if len(fields) >= 4 and fields[3] == "0A":  # TCP_LISTEN
+                listening.add(int(fields[1].rsplit(":", 1)[1], 16))
+    missing = set(config["ports"]) - listening
+    if missing:
+        raise ValueError(f"Required TCP ports are not listening: {sorted(missing)}")
     # rathole listens on :443 only after an authenticated client connects.
 
 

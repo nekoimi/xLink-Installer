@@ -5,9 +5,11 @@ import json
 import os
 from pathlib import Path
 import socket
+import sys
 import tempfile
 import tomllib
 import unittest
+from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
 
@@ -92,6 +94,7 @@ class InitializationTests(unittest.TestCase):
         self.assertEqual(config["xray_port"], 9443)
         self.assertEqual(config["rathole_port"], 80)
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Requires Linux /proc socket tables")
     def test_healthcheck_needs_only_proxy_and_tunnel_control_listeners(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as listeners:
             ports = []
@@ -103,6 +106,28 @@ class InitializationTests(unittest.TestCase):
             data = Path(directory)
             app.write(data / "health.json", json.dumps({"ports": ports}))
             app.healthcheck(data)
+
+    def test_healthcheck_reads_listeners_without_making_connections(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            proc_net = data / "proc-net"
+            proc_net.mkdir()
+            app.write(data / "health.json", json.dumps({"ports": [8443, 2333]}))
+            (proc_net / "tcp").write_text(
+                "sl local_address rem_address st\n"
+                "0: 00000000:20FB 00000000:0000 0A\n"
+                "1: 0100007F:091D 0100007F:FFFF 01\n", encoding="ascii")
+            with self.assertRaisesRegex(ValueError, "2333"):
+                app.healthcheck(data, proc_net)
+            (proc_net / "tcp6").write_text(
+                "sl local_address rem_address st\n"
+                "0: 00000000000000000000000000000000:091D "
+                "00000000000000000000000000000000:0000 0A\n", encoding="ascii")
+            with mock.patch("socket.socket", side_effect=AssertionError("Probe opened a socket")):
+                app.healthcheck(data, proc_net)
+            (proc_net / "tcp").unlink()
+            with self.assertRaisesRegex(ValueError, "8443"):
+                app.healthcheck(data, proc_net)
 
 
 if __name__ == "__main__":

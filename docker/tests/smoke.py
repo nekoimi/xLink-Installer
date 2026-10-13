@@ -107,6 +107,14 @@ def main(image):
                 return result.returncode == 0 and MARKER in result.stdout
 
             wait_for(healthy, "server ports (without a tunnel client)")
+            for _ in range(3):
+                if not healthy():
+                    raise RuntimeError("Repeated health check failed")
+            time.sleep(0.5)
+            logs = docker("logs", server)
+            if "Failed to do transport handshake" in logs.stdout + logs.stderr:
+                raise RuntimeError("Health checks triggered a transport handshake error")
+            print("Health checks do not trigger Noise handshakes OK", flush=True)
             identity = read_identity()
 
             (files / "client.json").write_text(json.dumps(client_config(identity)), encoding="utf-8")
