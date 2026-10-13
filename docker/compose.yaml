@@ -1,0 +1,37 @@
+services:
+  xlink:
+    image: ${XLINK_IMAGE:-ghcr.io/nekoimi/xlink-installer:latest}
+    container_name: xlink
+    restart: unless-stopped
+    stop_grace_period: 15s
+    environment:
+      PUBLIC_HOST: ${PUBLIC_HOST:?Set PUBLIC_HOST in .env}
+      REALITY_SERVER_NAME: ${REALITY_SERVER_NAME:-www.microsoft.com}
+      REALITY_TARGET: ${REALITY_TARGET:-}
+      XRAY_PORT: ${XRAY_PORT:-8443}
+      RATHOLE_PORT: ${RATHOLE_PORT:-2333}
+      TZ: ${TZ:-Asia/Shanghai}
+    ports:
+      - "443:443/tcp"
+      - "${RATHOLE_PORT:-2333}:${RATHOLE_PORT:-2333}/tcp"
+      - "${XRAY_PORT:-8443}:${XRAY_PORT:-8443}/tcp"
+    volumes:
+      - xlink-data:/data
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  xlink-data:
