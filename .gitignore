@@ -16,3 +16,6 @@ desktop.ini
 *.log
 *.tmp
 *.bak
+
+# Exported proxy client credentials
+/docker/clash.yaml

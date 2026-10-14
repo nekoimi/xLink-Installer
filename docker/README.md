@@ -40,6 +40,23 @@ docker compose exec xlink python3 /opt/xlink/app.py info
 
 链接包含 UUID、REALITY 公钥、short ID、SNI 和 `xtls-rprx-vision`。使用支持 VLESS REALITY/Vision 的客户端。节点凭据不会写入容器启动日志。
 
+使用 Mihomo / Clash Meta 客户端时，可以直接导出自动生成的 YAML，无需手动转换链接：
+
+```bash
+docker compose cp xlink:/data/clash.yaml ./clash.yaml
+chmod 600 clash.yaml
+```
+
+将文件导入客户端即可。配置包含本地混合代理端口 7890、节点和策略组，默认所有流量通过该节点；仅允许本机接入。本配置需要支持 VLESS REALITY/Vision 的 Mihomo / Clash Meta 内核，原版 Clash 不支持。已有配置时，可将导出文件的节点添加到现有 `proxies` 和策略组。
+
+也可以直接查看配置：
+
+```bash
+docker compose exec -T xlink python3 /opt/xlink/app.py clash
+```
+
+`clash.yaml` 随容器启动重新生成，与 VLESS 链接使用同一组节点参数；修改地址、端口或 SNI 后需重新导出并导入。使用包含此功能的新镜像重建容器后才能导出。文件包含节点凭据，请勿公开或提交到 Git。
+
 REALITY 服务端显式设置 `minClientVer: "0.0.0"`，不设最低客户端版本门槛；这是 Xray 配置中的字符串，不能写成数字 `0`。省略该字段同样不设置最低版本限制。客户端仍需支持 REALITY 和 Vision。
 
 首次运行自动生成并保存 UUID、REALITY 密钥、short ID、Noise 密钥和隧道 token。重启、重建及更新镜像都会复用数据卷中的身份信息。已有身份文件损坏时停止启动，不会悄悄生成新密钥。
@@ -85,6 +102,7 @@ Compose 使用命名卷 `xlink-data` 挂载到 `/data`，保存：
 
 - `identity.json`：所有身份密钥和 token，权限 600。
 - `vless.txt`：代理链接，权限 600。
+- `clash.yaml`：Mihomo / Clash Meta 客户端配置，权限 600。
 - `xray.json`、`rathole/server.toml`、`rathole/client.toml`：自动生成的服务/客户端配置。
 
 `xray.json` 和 rathole 配置由环境变量与身份文件自动生成，不应直接编辑。升级之前包含 Caddy 的 Docker 版本时，可直接复用原数据卷，节点及隧道身份保留；旧 Caddy 文件不再使用。

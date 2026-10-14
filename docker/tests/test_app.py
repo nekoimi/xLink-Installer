@@ -1,6 +1,7 @@
 import base64
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stdout
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -26,6 +27,25 @@ def key_output(args):
 
 
 class InitializationTests(unittest.TestCase):
+    def test_clash_export_reads_saved_config_without_regenerating_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            identity = app.identities(data, key_output)
+            app.render(data, app.settings({"PUBLIC_HOST": "vps.example.com"}), identity)
+            saved = (data / "identity.json").read_bytes()
+            output = io.StringIO()
+            with mock.patch.object(app, "DATA", data), \
+                    mock.patch.object(sys, "argv", ["app.py", "clash"]), \
+                    mock.patch.object(app, "identities", side_effect=AssertionError("Rotated identity")), \
+                    mock.patch.dict(os.environ, {}, clear=True), redirect_stdout(output):
+                self.assertEqual(app.main(), 0)
+            self.assertEqual(output.getvalue(), (data / "clash.yaml").read_text())
+            self.assertEqual((data / "identity.json").read_bytes(), saved)
+            self.assertNotIn(identity["reality_private_key"], output.getvalue())
+            self.assertNotIn(identity["rathole_token"], output.getvalue())
+            if os.name != "nt":
+                self.assertEqual((data / "clash.yaml").stat().st_mode & 0o777, 0o600)
+
     def test_restart_and_network_changes_keep_all_identities(self):
         with tempfile.TemporaryDirectory() as directory:
             data = Path(directory)

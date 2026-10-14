@@ -126,6 +126,42 @@ def authority(hostname):
     return f"[{hostname}]" if ":" in hostname else hostname
 
 
+def clash_config(config, identity):
+    # JSON string quoting is also valid YAML and preserves numeric-looking short IDs.
+    quote = json.dumps
+    return f'''# Generated for Mihomo / Clash Meta. Contains node credentials.
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+
+proxies:
+  - name: xLink-REALITY
+    type: vless
+    server: {quote(config['public_host'])}
+    port: {config['xray_port']}
+    uuid: {quote(identity['uuid'])}
+    network: tcp
+    udp: true
+    tls: true
+    flow: xtls-rprx-vision
+    servername: {quote(config['server_name'])}
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: {quote(identity['reality_public_key'])}
+      short-id: {quote(identity['short_id'])}
+
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - xLink-REALITY
+
+rules:
+  - MATCH,PROXY
+'''
+
+
 def render(data, config, identity):
     xray = {
         "log": {"loglevel": "warning"},
@@ -181,6 +217,7 @@ local_addr = "127.0.0.1:443"
     link = (f"vless://{identity['uuid']}@{authority(config['public_host'])}:"
             f"{config['xray_port']}?{query}#xLink-REALITY\n")
     write(data / "vless.txt", link)
+    write(data / "clash.yaml", clash_config(config, identity))
     write(data / "health.json", json.dumps({"ports": [config["xray_port"], config["rathole_port"]]}))
 
 
@@ -244,11 +281,12 @@ def main():
     if action == "healthcheck":
         healthcheck(DATA)
         return 0
-    if action == "info":
-        print((DATA / "vless.txt").read_text(encoding="utf-8"), end="")
+    if action in ("info", "clash"):
+        filename = "vless.txt" if action == "info" else "clash.yaml"
+        print((DATA / filename).read_text(encoding="utf-8"), end="")
         return 0
     if action not in ("serve", "init"):
-        raise ValueError("Usage: app.py [serve|init|info|healthcheck]")
+        raise ValueError("Usage: app.py [serve|init|info|clash|healthcheck]")
     config = settings(os.environ)
     DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
     DATA.chmod(0o700)
