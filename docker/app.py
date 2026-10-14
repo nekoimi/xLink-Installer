@@ -52,7 +52,7 @@ def endpoint(value, name):
 def settings(env):
     result = {
         "public_host": host(env.get("PUBLIC_HOST", ""), "PUBLIC_HOST"),
-        "server_name": host(env.get("REALITY_SERVER_NAME", "www.microsoft.com"),
+        "server_name": host(env.get("REALITY_SERVER_NAME", "www.cloudflare.com"),
                             "REALITY_SERVER_NAME", domain_only=True),
         "xray_port": int(env.get("XRAY_PORT", "8443")),
         "rathole_port": int(env.get("RATHOLE_PORT", "2333")),

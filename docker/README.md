@@ -28,7 +28,9 @@ docker compose logs -f
 
 如果之前已复制 `.env.example` 为 `.env`，请将已有 `.env` 中的 `XLINK_IMAGE` 同步改为新镜像地址；该变量会覆盖 Compose 的默认值。
 
-只有 `PUBLIC_HOST` 必填，不带协议、路径或端口。云安全组放行 TCP **8443、2333、443**（自定义端口时以实际配置为准）。REALITY 目标默认使用 `www.microsoft.com:443`，部署前确认 VPS 可以连接该目标，支持 TLS 1.3 和 HTTP/2；按实际网络情况调整 `REALITY_SERVER_NAME` 和 `REALITY_TARGET`。服务器与代理客户端的系统时间应准确。
+只有 `PUBLIC_HOST` 必填，不带协议、路径或端口。云安全组放行 TCP **8443、2333、443**（自定义端口时以实际配置为准）。REALITY 目标默认使用 `www.cloudflare.com:443`，部署前确认 VPS 可以连接该目标，支持 TLS 1.3 和 HTTP/2，并通过客户端验证实际代理访问；普通 TLS 测试成功不代表 REALITY 握手一定成功。按实际网络情况调整 `REALITY_SERVER_NAME` 和 `REALITY_TARGET`。服务器与代理客户端的系统时间应准确。
+
+已有 `.env` 会覆盖默认值。切换到 Cloudflare 时，将 `REALITY_SERVER_NAME` 改为 `www.cloudflare.com`，并将 `REALITY_TARGET` 留空或改为 `www.cloudflare.com:443`；重新创建容器后，重新获取并导入 VLESS 链接以更新客户端 SNI。
 
 获取并导入 VLESS 链接：
 
@@ -49,7 +51,7 @@ REALITY 服务端显式设置 `minClientVer: "0.0.0"`，不设最低客户端版
 | `PUBLIC_HOST` | 必填 | VPS 公网 IP 或直连 DNS，写入客户端链接/隧道示例 |
 | `XRAY_PORT` | `8443` | Xray REALITY TCP 端口 |
 | `RATHOLE_PORT` | `2333` | Noise 隧道 TCP 端口 |
-| `REALITY_SERVER_NAME` | `www.microsoft.com` | REALITY 伪装目标的 TLS SNI |
+| `REALITY_SERVER_NAME` | `www.cloudflare.com` | REALITY 伪装目标的 TLS SNI |
 | `REALITY_TARGET` | `<REALITY_SERVER_NAME>:443` | 实际 TLS 目标，格式为 `host:port`，IPv6 用 `[地址]:端口` |
 | `TZ` | `Asia/Shanghai` | 容器时区 |
 | `XLINK_IMAGE` | `ghcr.io/nekoimi/xlink-runtime:latest` | Compose 使用的镜像，建议生产部署固定发布标签或 digest |

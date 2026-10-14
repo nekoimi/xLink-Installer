@@ -6,7 +6,7 @@ services:
     stop_grace_period: 15s
     environment:
       PUBLIC_HOST: ${PUBLIC_HOST:?Set PUBLIC_HOST in .env}
-      REALITY_SERVER_NAME: ${REALITY_SERVER_NAME:-www.microsoft.com}
+      REALITY_SERVER_NAME: ${REALITY_SERVER_NAME:-www.cloudflare.com}
       REALITY_TARGET: ${REALITY_TARGET:-}
       XRAY_PORT: ${XRAY_PORT:-8443}
       RATHOLE_PORT: ${RATHOLE_PORT:-2333}
