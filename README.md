@@ -1,6 +1,6 @@
 # xLink-Installer
 
-如果希望通过 Docker 部署，可使用独立的 [Docker 版本](docker/README.md)：一个镜像运行 Xray VLESS + REALITY 和 rathole-server，不包含 3x-ui、Caddy 和调试工具。原安装脚本及下方的宿主机安装方式保持不变。
+如果希望通过 Docker 部署，可使用独立的 [Docker 版本](docker/README.md)：一个镜像运行 Xray VLESS + REALITY 和 rathole-server，Compose 配套 HAProxy 容器，通过 PROXY protocol 向内网传递真实客户端 IP。xLink 镜像不包含 3x-ui、Caddy 和调试工具。原安装脚本及下方的宿主机安装方式保持不变。
 
 在公网 Linux 服务器上部署 [3x-ui](https://github.com/MHSanaei/3x-ui)、[Caddy](https://caddyserver.com/) 和 [rathole](https://github.com/rathole-org/rathole)：rathole 独占公网 TCP 443，VPS Caddy 在 TCP 9443 为面板/订阅提供 HTTPS。rathole 将原始 TCP 流量经 Noise 隧道转交内网 Caddy，由内网 Caddy 终止 HTTPS 并根据域名分流。
 

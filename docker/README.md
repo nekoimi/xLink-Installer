@@ -1,14 +1,16 @@
 # xLink Docker
 
-一个镜像运行 **Xray VLESS + REALITY + Vision、rathole-server（Noise）**。不包含 3x-ui、Caddy、数据库或服务器调试工具，不执行宿主机初始化。原来的 `install.sh` 保持独立。
+一个镜像运行 **Xray VLESS + REALITY + Vision、rathole-server（Noise）**，Compose 另起一个 HAProxy 容器，为内网 HTTPS 传递真实客户端 IP。xLink 镜像不包含 3x-ui、Caddy、数据库或服务器调试工具，不执行宿主机初始化。原来的 `install.sh` 保持独立。
 
 ```text
 代理客户端 → VPS TCP 8443 → Xray REALITY → Internet
-公网用户   → VPS TCP 443  → rathole → 内网 rathole-client → 内网应用
+公网用户   → VPS TCP 443  → HAProxy → xlink:443 → rathole Noise → 内网 Caddy → 应用
 内网客户端 → VPS TCP 2333 → rathole Noise 隧道
 ```
 
-REALITY 由 Xray 直接处理，无需 HTTP 反代或申请域名证书。443 保留给内网穿透；Xray 默认使用 8443。宿主机不能有其他程序占用映射端口。
+REALITY 由 Xray 直接处理，无需 HTTP 反代或申请域名证书。HAProxy 独占宿主机 TCP 443，添加 PROXY protocol v2 后将原始 TLS 流转给 xlink 容器的 TCP 443；Xray 默认使用 8443。宿主机不能有其他程序占用映射端口。业务域名使用直连 VPS 的 DNS 记录；这里传递的是直接连接 HAProxy 的来源地址。
+
+内网 HTTPS 入口必须先解析 PROXY protocol，再处理 TLS。Caddy 2.7 起内置该模块。升级公网 Compose 前应先完成内网配置，否则 HAProxy 加入的 PROXY 头会导致原有 TLS 入口握手失败。配套步骤见下方“真实客户端 IP”。
 
 ## 快速启动
 
@@ -94,7 +96,52 @@ rathole --client client.toml
 
 默认 `local_addr = "127.0.0.1:443"`，将公网 TCP 443 转发给内网同端口服务。可改为应用实际的可达 IP 和端口。如果需要按域名分流多个 HTTPS 应用，可在内网端自行部署 Caddy 等反向代理，业务域名解析到 VPS，证书通过 DNS-01 申请；Docker 服务端不参与 HTTPS 终止或证书签发。
 
-服务端只有在客户端成功认证 `internal_https` 后才监听 TCP 443；客户端尚未接入时容器也可以是 healthy。这里只转发 TCP，不转发内网 HTTP/3 的 UDP 443。
+服务端只有在客户端成功认证 `internal_https` 后才监听容器内 TCP 443；客户端尚未接入时 xlink 也可以是 healthy。HAProxy 等待 xlink 健康后启动，监听宿主机 TCP 443；隧道离线时请求无法转发。这里只转发 TCP，不转发内网 HTTP/3 的 UDP 443。
+
+## 真实客户端 IP
+
+Compose 中 xlink 的 TCP 443 不发布到宿主机，HAProxy 通过同一个 Compose 网络连接 `xlink:443`。控制端口与 Xray 端口保持原来的映射。`haproxy/haproxy.cfg` 使用 `send-proxy-v2`，Rathole 只需透传这些字节，镜像和自动生成的 Rathole 配置无需修改。HAProxy 使用 Docker DNS 定期刷新 xlink 的地址；不对业务端口执行主动连接探测。
+
+内网 Caddy 的全局配置示例：
+
+```caddyfile
+{
+    servers {
+        listener_wrappers {
+            proxy_protocol {
+                timeout 2s
+                allow 172.30.254.3/32
+                fallback_policy reject
+            }
+            tls
+        }
+    }
+}
+```
+
+示例地址必须替换成 Rathole Client 的固定来源 IP。建议让它与 Caddy 使用专用 Docker 网络，其他应用继续使用原业务网络，避免其他容器伪造 PROXY 头。`fallback_policy reject` 拒绝来自非授权地址的 PROXY 头；普通内网 HTTPS 连接仍可直接访问 Caddy。
+
+在内网检查当前镜像：
+
+```bash
+docker exec caddy caddy version
+docker exec caddy caddy list-modules | grep caddy.listeners.proxy_protocol
+```
+
+上线顺序：先更新内网 Caddy 与 Rathole Client，再更新公网 Compose。旧的原始 TLS 流仍能通过已启用解析的 Caddy；公网切换 HAProxy 后即可解析真实 IP。
+
+在公网 `docker/` 目录检查配置并应用：
+
+```bash
+docker compose config --quiet
+docker compose run --rm --no-deps haproxy haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg
+docker compose up -d
+docker compose logs --tail=100 haproxy
+```
+
+Caddy 反向代理会通过 `X-Forwarded-For` 将来源地址传给应用，应用也需要信任 Caddy。启用 Caddy 的站点访问日志后，从外部网络请求域名，对照日志中的客户端 IP 与访问端公网 IP。仅确认网页可打开还不足以验证真实 IP。
+
+回退时先恢复公网 xlink 的 `443:443/tcp` 映射并移除 HAProxy 容器，再按需恢复内网配置。不要让两个公网容器同时发布 443，也不要删除身份数据卷。
 
 ## 数据和运维
 
@@ -143,7 +190,7 @@ docker build -t xlink:local ./docker
 
 使用 GitHub 自动提供的 `GITHUB_TOKEN`，发布 job 声明 `packages: write`，不需要配置个人 token。如果组织策略限制包发布，需要管理员在仓库/组织中允许对应权限。首次发布后如需匿名拉取，在 GitHub Packages 中将镜像可见性设置为 Public；包可能默认是 Private。
 
-workflow 在发布前执行配置/持久化测试和真实 amd64 容器测试：REALITY 代理、Noise 隧道转发、重启身份保留、正常停止及子进程失败处理。测试使用 Python TLS 服务器和 CI 宿主机生成的临时证书，不依赖外部网站或公共证书签发。arm64 由多架构构建验证，不运行相同的通信测试。
+workflow 在发布前检查 Compose 和 HAProxy 配置，并执行配置/持久化测试和真实 amd64 容器测试：REALITY 代理、Noise 隧道转发、重启身份保留、正常停止及子进程失败处理。现有通信测试直接连接 Rathole，不覆盖完整的 HAProxy → Rathole → Caddy 链路；部署后仍需验证真实 IP。测试使用 Python TLS 服务器和 CI 宿主机生成的临时证书，不依赖外部网站或公共证书签发。arm64 由多架构构建验证，不运行相同的通信测试。
 
 ```bash
 python -m unittest discover -s docker/tests -v
